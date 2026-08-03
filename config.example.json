@@ -1,0 +1,26 @@
+{
+  "_comment": "OPTIONAL. Only needed for the central-collector mode, where one container polls several NASes over the network. The normal deployment is one container per NAS, configured entirely by environment variables (see .env.example), which needs no config file at all. If this file is mounted at /app/config.json it takes precedence over the environment.",
+
+  "days": 90,
+  "output": "/app/web/data.json",
+  "file_counts": false,
+
+  "nases": [
+    {
+      "name": "Acme Co - DS923+",
+      "host": "192.168.1.10",
+      "port": 5001,
+      "https": true,
+      "verify_ssl": false,
+      "username": "svc-drivemonitor",
+      "password_env": "SYNO_PASS_ACME"
+    },
+    {
+      "name": "Widget LLC - DS220+",
+      "base_url": "https://widget.example.com:5001",
+      "verify_ssl": true,
+      "username": "svc-drivemonitor",
+      "password_env": "SYNO_PASS_WIDGET"
+    }
+  ]
+}

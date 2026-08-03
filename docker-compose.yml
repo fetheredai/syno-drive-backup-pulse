@@ -1,0 +1,49 @@
+# Synology Drive Backup Pulse — one container per NAS, running on the NAS
+# it monitors.
+#
+# In DSM: Container Manager > Project > Create, paste this file, and put the
+# credentials in a .env file beside it (see .env.example).
+#
+# Networking note: host mode lets the container reach DSM on localhost:5000,
+# so no certificate or firewall configuration is needed — that traffic never
+# leaves the NAS. If you would rather use bridge networking, comment out
+# network_mode, uncomment the ports block, and set SYNO_HOST to the NAS's own
+# LAN IP.
+
+services:
+  backup-pulse:
+    # Set PULSE_IMAGE in .env to the path GitHub Actions publishes, e.g.
+    # ghcr.io/<your-github-user>/syno-drive-backup-pulse:latest
+    # (lowercase — registries reject uppercase in image paths).
+    image: ${PULSE_IMAGE:?set PULSE_IMAGE in .env}
+    container_name: backup-pulse
+    restart: unless-stopped
+    network_mode: host
+    # ports:
+    #   - "8477:8477"
+    environment:
+      # --- what to call this NAS in the dashboard -----------------------
+      SYNO_NAS_NAME: "${SYNO_NAS_NAME:-Synology NAS}"
+
+      # --- how to reach DSM --------------------------------------------
+      # localhost:5000 over plain HTTP is the default and is what you want
+      # when the container runs on the NAS being monitored.
+      SYNO_HOST: "${SYNO_HOST:-localhost}"
+      SYNO_PORT: "${SYNO_PORT:-5000}"
+      SYNO_HTTPS: "${SYNO_HTTPS:-false}"
+      SYNO_VERIFY_SSL: "${SYNO_VERIFY_SSL:-false}"
+
+      # --- service account ---------------------------------------------
+      # Must be in the administrators group, with 2FA disabled.
+      SYNO_USER: "${SYNO_USER:?set SYNO_USER in .env}"
+      SYNO_PASS: "${SYNO_PASS:?set SYNO_PASS in .env}"
+
+      # --- behaviour ----------------------------------------------------
+      SYNO_DAYS: "${SYNO_DAYS:-90}"              # history window
+      SYNO_INTERVAL_HOURS: "${SYNO_INTERVAL_HOURS:-4}"
+      SYNO_FILE_COUNTS: "${SYNO_FILE_COUNTS:-false}"  # slow; opt in
+      SYNO_WEB_PORT: "${SYNO_WEB_PORT:-8477}"
+
+# Deliberately no volume on /app/web: data.json is rebuilt from the NAS log on
+# every run, and a named volume there would shadow the image's dashboard.html
+# and keep serving the old one after you pull a new image.

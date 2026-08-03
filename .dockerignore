@@ -1,0 +1,14 @@
+.env
+config.json
+web/data.json
+*.pyc
+__pycache__/
+.git/
+.gitignore
+tests/
+mock_dsm.py
+README.md
+HANDOFF.md
+docker-compose.yml
+.env.example
+build.sh

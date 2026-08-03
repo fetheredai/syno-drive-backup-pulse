@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drive Backup Pulse</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#F2F4F6; --panel:#FFFFFF; --ink:#16232E; --muted:#5C6B78; --line:#DDE3E8;
+    --ok:#1F9D66; --stale:#D98B1F; --failing:#C6413B; --never:#8A97A3; --accent:#22679C;
+    --cell-empty:#E7ECEF;
+    --c1:#D9EDE2; --c2:#A9D8BE; --c3:#63BB90; --c4:#1F9D66;
+    --sans:"IBM Plex Sans",system-ui,sans-serif; --mono:"IBM Plex Mono",ui-monospace,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px}
+
+  header{position:sticky;top:0;z-index:20;background:var(--panel);border-bottom:1px solid var(--line);
+    padding:14px 24px;display:flex;flex-wrap:wrap;gap:14px;align-items:center}
+  .brand{margin-right:auto}
+  .brand h1{margin:0;font-size:17px;font-weight:700;letter-spacing:-.01em}
+  .brand .sub{font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .counts{display:flex;gap:8px}
+  .chip{border:1px solid var(--line);background:var(--panel);border-radius:4px;padding:6px 10px;
+    font-family:var(--mono);font-size:12px;cursor:pointer;display:flex;gap:7px;align-items:center;color:var(--ink)}
+  .chip .dot{width:9px;height:9px;border-radius:2px}
+  .chip[data-on="1"]{border-color:var(--ink);box-shadow:inset 0 0 0 1px var(--ink)}
+  .chip:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  select,input[type=search]{font-family:var(--mono);font-size:12px;padding:7px 9px;border:1px solid var(--line);
+    border-radius:4px;background:var(--panel);color:var(--ink)}
+  input[type=search]{width:190px}
+
+  main{max-width:1180px;margin:0 auto;padding:20px 24px 60px}
+  .meta{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;
+    font-family:var(--mono);font-size:11px;color:var(--muted);margin:2px 2px 10px}
+  .banner{background:#FCF3E4;border:1px solid #EAD3A6;border-radius:4px;padding:9px 12px;
+    font-size:13px;margin-bottom:14px;display:none}
+
+  /* the pulse wall */
+  /* overflow:clip, not hidden — hidden makes .wall a scroll container, which
+     re-anchors the sticky axis row to the wall's own top edge and drops it on
+     top of the first user row. clip gives the same rounded-corner clipping
+     without capturing the sticky. */
+  .wall{background:var(--panel);border:1px solid var(--line);border-radius:6px;overflow:clip}
+  .axisrow,.row{display:grid;grid-template-columns:290px 1fr;align-items:center}
+  /* --headerh is measured from the real header at runtime; a hardcoded offset
+     breaks as soon as the header wraps on a narrower window. */
+  .axisrow{border-bottom:1px solid var(--line);background:#FAFBFC;position:sticky;top:var(--headerh,63px);z-index:10}
+  .axisrow .lab{padding:8px 16px;font-family:var(--mono);font-size:10px;color:var(--muted);
+    text-transform:uppercase;letter-spacing:.08em}
+  .strip-wrap{padding:8px 16px 8px 0;overflow-x:auto}
+  /* Every row scrolls, but they are kept in lockstep by JS so the shared
+     calendar axis stays honest. Only the axis row shows a scrollbar, so there
+     is one obvious control instead of one per user. */
+  .row .strip-wrap{scrollbar-width:none}
+  .row .strip-wrap::-webkit-scrollbar{display:none}
+  .months{position:relative;height:14px;min-width:var(--stripw)}
+  .months span{position:absolute;top:0;font-family:var(--mono);font-size:10px;color:var(--muted)}
+
+  .row{border-bottom:1px solid var(--line)}
+  .row:last-child{border-bottom:none}
+  .who{padding:13px 16px;min-width:0}
+  .who .top{display:flex;align-items:center;gap:8px}
+  .uname{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pill{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;
+    color:#fff;border-radius:3px;padding:2px 6px;flex:none}
+  .pill.ok{background:var(--ok)} .pill.stale{background:var(--stale)}
+  .pill.failing{background:var(--failing)} .pill.never{background:var(--never)}
+  .who .sub{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:3px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .roots{margin-top:7px;display:flex;flex-wrap:wrap;gap:5px}
+  .root{border:1px solid var(--line);border-radius:3px;padding:2px 7px;font-size:11px;background:#FAFBFC}
+  .root b{font-family:var(--mono);font-weight:500;color:var(--muted);margin-left:5px}
+
+  .strip{display:grid;grid-auto-flow:column;gap:2px;min-width:var(--stripw);position:relative}
+  .cell{width:11px;height:26px;border-radius:2px;background:var(--cell-empty)}
+  .cell.l1{background:var(--c1)} .cell.l2{background:var(--c2)}
+  .cell.l3{background:var(--c3)} .cell.l4{background:var(--c4)}
+  .cell.future{background:transparent}
+  .cell:hover{outline:1.5px solid var(--ink);outline-offset:1px}
+
+  .nasblock{margin:26px 2px 8px;display:flex;align-items:baseline;gap:10px}
+  .nasblock h2{margin:0;font-size:15px;font-weight:700}
+  .nasblock .host{font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .nasblock .err{font-family:var(--mono);font-size:11px;color:var(--failing)}
+
+  #tip{position:fixed;z-index:50;background:var(--ink);color:#fff;font-family:var(--mono);font-size:11px;
+    padding:5px 8px;border-radius:3px;pointer-events:none;display:none;white-space:nowrap}
+  .empty{padding:30px;text-align:center;color:var(--muted);font-family:var(--mono);font-size:12px}
+  .legend{display:flex;gap:6px;align-items:center;font-family:var(--mono);font-size:10px;color:var(--muted)}
+  .legend .cell{width:10px;height:10px}
+
+  @media (max-width:760px){
+    .axisrow,.row{grid-template-columns:1fr}
+    .axisrow .lab{display:none}
+    .strip-wrap{padding:0 16px 12px}
+    header{padding:12px 16px} main{padding:16px 12px 60px}
+    input[type=search]{width:130px}
+  }
+  @media (prefers-reduced-motion:no-preference){
+    .row{transition:background .12s} .row:hover{background:#FBFCFD}
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>Drive Backup Pulse</h1>
+    <div class="sub" id="genat">—</div>
+  </div>
+  <div class="counts" id="counts"></div>
+  <select id="nassel" aria-label="Filter by NAS"><option value="">All NASes</option></select>
+  <input type="search" id="q" placeholder="find user…" aria-label="Search users">
+</header>
+
+<main>
+  <div class="banner" id="banner"></div>
+  <div class="meta">
+    <span id="windowlab"></span>
+    <span class="legend">less <span class="cell"></span><span class="cell l1"></span><span class="cell l2"></span><span class="cell l3"></span><span class="cell l4"></span> more files synced/day</span>
+  </div>
+  <div id="content"></div>
+</main>
+<div id="tip" role="tooltip"></div>
+
+<script>
+/* ---------- sample data (used when web/data.json isn't reachable) -------- */
+function sampleData(){
+  const now = Math.floor(Date.now()/1000), days = 90;
+  const mk = (name, roots, pattern, lastOffsetDays, dev) => {
+    const daily = {};
+    for (let i = 0; i < days; i++){
+      const t = now - i*86400;
+      const d = new Date(t*1000).toISOString().slice(0,10);
+      const dow = new Date(t*1000).getDay();
+      if (i < lastOffsetDays) continue;
+      if (pattern === 'daily' && dow !== 0 && dow !== 6) daily[d] = 40 + ((i*37)%400);
+      if (pattern === 'spotty' && (i%3===0) && dow!==0) daily[d] = 10 + ((i*53)%120);
+      if (pattern === 'heavy') daily[d] = 200 + ((i*91)%900);
+    }
+    const last = Object.keys(daily).sort().pop();
+    return { username:name.toLowerCase().replace(/\s/g,''), display_name:name,
+      devices:[{name:dev,last_seen: last? Math.floor(new Date(last).getTime()/1000):null,online:lastOffsetDays<2,type:'Drive Client'}],
+      roots:roots.map(r=>({name:r[0],files:r[1]})),
+      daily, last_success: last? Math.floor(new Date(last).getTime()/1000):null,
+      status: !last ? 'never' : lastOffsetDays<=2 ? 'ok' : lastOffsetDays<=7 ? 'stale' : 'failing' };
+  };
+  return { generated_at: now, days, sample:true, nases:[
+    { name:'Acme Co — DS923+', host:'192.168.1.10', users:[
+      mk('J Smith',[['Desktop',1543],['Documents',8210],['Downloads',912]],'daily',0,'DESKTOP-JS5'),
+      mk('M Rivera',[['Documents',12044],['Pictures',30211]],'heavy',1,'ACME-MR-LT'),
+      mk('T Nguyen',[['Desktop',644],['Documents',3020]],'spotty',4,'ACME-TN'),
+      mk('P Okafor',[['Documents',5511]],'daily',12,'ACME-PO-LT'),
+      mk('D Kowalski',[],'daily',999,'—'),
+    ]},
+    { name:'Widget LLC — DS220+', host:'10.20.0.5', users:[
+      mk('A Chen',[['Desktop',801],['Documents',6600],['Downloads',233]],'daily',0,'WIDGET-AC'),
+      mk('R Patel',[['Documents',9902]],'spotty',6,'WIDGET-RP'),
+      mk('S Dubois',[['Desktop',1200],['Pictures',18044]],'heavy',22,'WIDGET-SD'),
+    ]}
+  ]};
+}
+
+/* ---------- state -------------------------------------------------------- */
+const STATUSES = ['ok','stale','failing','never'];
+const LABELS = {ok:'OK', stale:'Stale', failing:'Failing', never:'Never'};
+let DATA = null;
+let filt = { statuses:new Set(STATUSES), nas:'', q:'' };
+
+const rel = ts => {
+  if (!ts) return 'no backups seen';
+  const s = Math.floor(Date.now()/1000) - ts;
+  if (s < 3600) return Math.max(1,Math.floor(s/60)) + ' min ago';
+  if (s < 86400) return Math.floor(s/3600) + ' h ago';
+  return Math.floor(s/86400) + ' d ago';
+};
+const fmtN = n => n==null ? '' : n.toLocaleString();
+
+/* ---------- render ------------------------------------------------------- */
+function render(){
+  const days = DATA.days || 90;
+  const stripw = days*11 + (days-1)*2;
+  document.documentElement.style.setProperty('--stripw', stripw+'px');
+  document.getElementById('genat').textContent =
+    'collected ' + new Date(DATA.generated_at*1000).toLocaleString();
+  document.getElementById('windowlab').textContent = 'last ' + days + ' days · one column = one day · today at right';
+
+  // status counts across everything
+  const all = DATA.nases.flatMap(n=>n.users.map(u=>({...u,_nas:n.name})));
+  const counts = Object.fromEntries(STATUSES.map(s=>[s, all.filter(u=>u.status===s).length]));
+  const cWrap = document.getElementById('counts'); cWrap.innerHTML='';
+  STATUSES.forEach(s=>{
+    const b = document.createElement('button');
+    b.className='chip'; b.dataset.on = filt.statuses.has(s)?'1':'0';
+    b.innerHTML = `<span class="dot" style="background:var(--${s})"></span>${LABELS[s]} <b>${counts[s]}</b>`;
+    b.onclick = () => { filt.statuses.has(s)?filt.statuses.delete(s):filt.statuses.add(s); render(); };
+    cWrap.appendChild(b);
+  });
+
+  const sel = document.getElementById('nassel');
+  if (sel.options.length === 1)
+    DATA.nases.forEach(n=>{ const o=document.createElement('option'); o.value=o.textContent=n.name; sel.appendChild(o); });
+  // One container per NAS is the normal deployment, so the picker is only
+  // meaningful when a central collector has pulled from several.
+  sel.style.display = (DATA.nases.length > 1) ? '' : 'none';
+
+  // A stopped collector is itself a failure mode: without this the dashboard
+  // would keep showing weeks-old data as though it were current.
+  const banner = document.getElementById('banner');
+  const ageH = (Date.now()/1000 - (DATA.generated_at||0))/3600;
+  if (DATA.sample){ banner.style.display='block';
+    banner.textContent = 'Showing sample data — data.json not found. The collector has not written any results yet; check the container log in Container Manager.'; }
+  else if (ageH > 24){ banner.style.display='block';
+    banner.textContent = `Data is ${Math.floor(ageH/24)} day(s) old — the collector may have stopped. Check the container and its /healthz endpoint.`; }
+
+  // day columns (shared axis)
+  const dayKeys = [];
+  const today = new Date(); today.setHours(0,0,0,0);
+  for (let i=days-1;i>=0;i--){
+    const d = new Date(today.getTime() - i*86400000);
+    dayKeys.push(d.toISOString().slice(0,10));
+  }
+  const monthMarks = [];
+  dayKeys.forEach((k,i)=>{ if (k.endsWith('-01') || i===0)
+      monthMarks.push({i, lab: new Date(k+'T00:00').toLocaleString(undefined,{month:'short'})}); });
+
+  const order = {failing:0, never:1, stale:2, ok:3};
+  const content = document.getElementById('content'); content.innerHTML='';
+
+  DATA.nases.forEach(nas=>{
+    if (filt.nas && nas.name !== filt.nas) return;
+    const users = (nas.users||[])
+      .filter(u=>filt.statuses.has(u.status))
+      .filter(u=>!filt.q || (u.username+' '+(u.display_name||'')).toLowerCase().includes(filt.q))
+      .sort((a,b)=> order[a.status]-order[b.status] || a.username.localeCompare(b.username));
+
+    const head = document.createElement('div'); head.className='nasblock';
+    head.innerHTML = `<h2>${nas.name}</h2><span class="host">${nas.host||''}</span>` +
+      (nas.error?`<span class="err">collector error: ${nas.error}</span>`:'');
+    content.appendChild(head);
+
+    const wall = document.createElement('div'); wall.className='wall';
+    // axis
+    const axis = document.createElement('div'); axis.className='axisrow';
+    const monthsHtml = monthMarks.map(m=>`<span style="left:${m.i*13}px">${m.lab}</span>`).join('');
+    axis.innerHTML = `<div class="lab">user / backup roots</div>
+      <div class="strip-wrap"><div class="months">${monthsHtml}</div></div>`;
+    wall.appendChild(axis);
+
+    if (!users.length){
+      const e=document.createElement('div'); e.className='empty';
+      e.textContent = nas.error ? 'no data — fix the collector error above' : 'no users match the current filters';
+      wall.appendChild(e);
+    }
+
+    users.forEach(u=>{
+      const row = document.createElement('div'); row.className='row';
+      const dev = (u.devices&&u.devices[0]) ? u.devices[0].name : null;
+      const rootsHtml = (u.roots||[]).map(r=>
+        `<span class="root">${r.name}${r.files!=null?`<b>${fmtN(r.files)}</b>`:''}</span>`).join('')
+        || '<span class="root" style="color:var(--muted)">no folders detected</span>';
+      const cells = dayKeys.map(k=>{
+        const v = (u.daily||{})[k]||0;
+        const lvl = v===0?'':v<25?'l1':v<100?'l2':v<400?'l3':'l4';
+        return `<span class="cell ${lvl}" data-d="${k}" data-v="${v}"></span>`;
+      }).join('');
+      row.innerHTML = `
+        <div class="who">
+          <div class="top"><span class="uname">${u.display_name||u.username}</span>
+            <span class="pill ${u.status}">${LABELS[u.status]}</span></div>
+          <div class="sub">${u.username}${dev?' · '+dev:''} · last backup ${rel(u.last_success)}</div>
+          <div class="roots">${rootsHtml}</div>
+        </div>
+        <div class="strip-wrap"><div class="strip">${cells}</div></div>`;
+      wall.appendChild(row);
+    });
+    content.appendChild(wall);
+  });
+}
+
+/* ---------- tooltip ------------------------------------------------------ */
+const tip = document.getElementById('tip');
+document.addEventListener('mouseover', e=>{
+  const c = e.target.closest('.cell[data-d]');
+  if (!c){ tip.style.display='none'; return; }
+  tip.textContent = `${c.dataset.d} — ${(+c.dataset.v).toLocaleString()} file events`;
+  tip.style.display='block';
+});
+document.addEventListener('mousemove', e=>{
+  if (tip.style.display==='block'){ tip.style.left=(e.clientX+12)+'px'; tip.style.top=(e.clientY+14)+'px'; }
+});
+
+document.getElementById('nassel').addEventListener('change', e=>{ filt.nas=e.target.value; render(); });
+document.getElementById('q').addEventListener('input', e=>{ filt.q=e.target.value.trim().toLowerCase(); render(); });
+
+/* ---------- shared horizontal scrolling ---------------------------------- */
+/* The heatmap is wider than most screens. Each row is its own scroller, so
+   without this the month axis and the user rows drift out of alignment the
+   moment anyone scrolls sideways — the calendar would start lying. One
+   capturing listener keeps every strip on the same scrollLeft. */
+let _syncing = false;
+document.addEventListener('scroll', e=>{
+  const el = e.target;
+  if (!(el instanceof HTMLElement) || !el.classList.contains('strip-wrap')) return;
+  if (_syncing) return;
+  _syncing = true;
+  document.querySelectorAll('.strip-wrap').forEach(o=>{ if (o!==el) o.scrollLeft = el.scrollLeft; });
+  _syncing = false;
+}, true);
+
+/* Pin the month axis directly beneath the real header, whatever height it is. */
+const setHeaderH = () => document.documentElement.style
+  .setProperty('--headerh', document.querySelector('header').offsetHeight + 'px');
+setHeaderH();
+addEventListener('resize', setHeaderH);
+
+/* ---------- boot --------------------------------------------------------- */
+fetch('data.json', {cache:'no-store'})
+  .then(r=>{ if(!r.ok) throw 0; return r.json(); })
+  .then(d=>{ DATA=d; render(); })
+  .catch(()=>{ DATA=sampleData(); render(); });
+</script>
+</body>
+</html>

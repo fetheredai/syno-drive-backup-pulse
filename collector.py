@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""
+Synology Drive Backup Status Collector
+--------------------------------------
+Pulls per-user Synology Drive sync/backup activity from the NAS using the DSM
+Web API (the same endpoints the Drive Admin Console web UI calls), aggregates
+it into a JSON file, and that JSON feeds web/dashboard.html.
+
+Normal deployment is one container per NAS, running ON the NAS it monitors, so
+the default target is the local DSM over plain HTTP on localhost:5000 — that
+traffic never leaves the box, so there are no certificate or firewall problems
+to solve.
+
+Data collected per non-admin user:
+  - Devices (client list): device name, last connection time, status
+  - Daily sync activity for the last N days (from the Drive Server log)
+  - Root folders being backed up (Desktop, Documents, ...) inferred from
+    logged file paths, with optional file counts via File Station DirSize
+  - Overall status: ok / stale / failing / never
+
+CONFIGURATION
+  Two ways, environment variables being the container-friendly one:
+
+  1. Environment variables (used when no config.json is present):
+       SYNO_NAS_NAME    label shown in the dashboard      (default: hostname)
+       SYNO_HOST        DSM host                          (default: localhost)
+       SYNO_PORT        DSM port                          (default: 5000)
+       SYNO_HTTPS       true/false                        (default: false)
+       SYNO_VERIFY_SSL  true/false                        (default: false)
+       SYNO_BASE_URL    full URL, overrides host/port/https  (optional)
+       SYNO_USER        service account name              (required)
+       SYNO_PASS        service account password
+       SYNO_PASS_FILE   file to read the password from (Docker secrets)
+       SYNO_DAYS        history window in days            (default: 90)
+       SYNO_OUTPUT      output path            (default: web/data.json)
+       SYNO_FILE_COUNTS true/false, per-root file counts  (default: false)
+
+  2. config.json (see config.example.json) — still supports several NASes in
+     one run, for a central collector rather than one container per NAS.
+
+IMPORTANT NOTE ON ENDPOINTS
+  The Drive Admin Console APIs (SYNO.SynologyDrive.*) are not publicly
+  documented by Synology and field names can vary between Drive Server
+  versions. This script:
+    1. Auto-discovers available API names/versions via SYNO.API.Info.
+    2. Uses defensive parsing (multiple candidate field names).
+    3. Has a --discover mode that prints every SYNO.SynologyDrive.* API
+       your NAS exposes, plus a sample log entry, so you can adjust the
+       CANDIDATE_* constants below if your Drive Server version differs.
+  If something comes back empty, run:  python3 collector.py --discover
+  and compare with what you see in browser DevTools (Network tab) while
+  using Drive Admin Console.
+
+Requires: Python 3.8+, requests  (pip install requests)
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import socket
+import sys
+import time
+from collections import defaultdict
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Missing dependency: pip install requests")
+
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ---------------------------------------------------------------------------
+# Candidate API names / parameters. Verified against Drive Server 3.x era
+# behavior; adjust after running --discover if your version differs.
+# ---------------------------------------------------------------------------
+CANDIDATE_CONNECTION_APIS = [
+    "SYNO.SynologyDrive.Connection",   # client list (devices)
+]
+CANDIDATE_LOG_APIS = [
+    "SYNO.SynologyDrive.Log",          # Drive Admin Console > Log
+]
+# Log item fields we look for (first match wins):
+F_USER = ["username", "user", "owner", "opuser", "user_name"]
+F_TIME = ["time", "timestamp", "utime", "mtime", "log_time"]
+F_PATH = ["path", "file_path", "target", "filename", "display_path", "name"]
+F_ACTION = ["action", "category", "type", "event", "method"]
+F_DEVICE = ["device_name", "device", "computer_name", "client", "hostname"]
+
+# Log actions that count as "data moved" (a backup actually did something).
+SYNC_ACTIONS = {"upload", "edit", "create", "add", "modify", "sync",
+                "create_file", "create_folder", "rename", "download"}
+# Actions we ignore entirely
+IGNORE_ACTIONS = {"login", "logout", "browse", "preview"}
+
+
+class SynoSession:
+    """Thin DSM Web API client with API auto-discovery."""
+
+    def __init__(self, name, host="localhost", port=5000, https=False,
+                 verify_ssl=False, username=None, password=None, base_url=None):
+        self.name = name
+        if base_url:
+            self.base = base_url.rstrip("/") + "/webapi"
+        else:
+            scheme = "https" if https else "http"
+            self.base = f"{scheme}://{host}:{port}/webapi"
+        self.verify = verify_ssl
+        self.username = username
+        self.password = password
+        self.sid = None
+        self.apis = {}          # api name -> {path, minVersion, maxVersion}
+        self.s = requests.Session()
+
+    # -- plumbing -----------------------------------------------------------
+    def _get(self, path, params):
+        r = self.s.get(f"{self.base}/{path}", params=params,
+                       verify=self.verify, timeout=30)
+        r.raise_for_status()
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(
+                f"[{self.name}] Non-JSON reply from {self.base}/{path} "
+                f"(HTTP {r.status_code}). Wrong port, or DSM redirected to a "
+                f"login page — check SYNO_HOST/SYNO_PORT/SYNO_HTTPS.")
+        if not data.get("success"):
+            err = data.get("error") or {}
+            code = err.get("code")
+            hint = AUTH_ERRORS.get(code, "")
+            raise RuntimeError(f"[{self.name}] API error on {params.get('api')}: "
+                               f"{json.dumps(err)}{hint}")
+        return data.get("data", {})
+
+    def call(self, api, method, version=None, **kw):
+        info = self.apis.get(api)
+        if not info:
+            raise RuntimeError(f"[{self.name}] API not available on this NAS: {api}")
+        params = {
+            "api": api,
+            "method": method,
+            "version": version or info["maxVersion"],
+            "_sid": self.sid,
+        }
+        params.update(kw)
+        return self._get(info["path"], params)
+
+    # -- auth ---------------------------------------------------------------
+    def connect(self):
+        # Discover all APIs (paths + versions) first — this is the documented
+        # bootstrap step and also powers --discover.
+        self.apis = self._get("query.cgi", {
+            "api": "SYNO.API.Info", "method": "query",
+            "version": 1, "query": "all",
+        })
+        auth = self.apis.get("SYNO.API.Auth", {"path": "auth.cgi", "maxVersion": 6})
+        ver = min(auth.get("maxVersion", 6), 6)
+        data = self._get(auth["path"], {
+            "api": "SYNO.API.Auth", "method": "login", "version": ver,
+            "account": self.username, "passwd": self.password,
+            "session": "DriveMonitor", "format": "sid",
+        })
+        self.sid = data["sid"]
+
+    def logout(self):
+        try:
+            auth = self.apis.get("SYNO.API.Auth")
+            if auth and self.sid:
+                self._get(auth["path"], {"api": "SYNO.API.Auth", "method": "logout",
+                                         "version": 1, "session": "DriveMonitor",
+                                         "_sid": self.sid})
+        except Exception:
+            pass
+
+    # -- users --------------------------------------------------------------
+    def list_users(self, page_size=200, max_pages=50):
+        """SYNO.Core.User.list is paged; walk it so big directories aren't cut off."""
+        users, offset = [], 0
+        for _ in range(max_pages):
+            data = self.call("SYNO.Core.User", "list",
+                             offset=offset, limit=page_size,
+                             additional=json.dumps(["email", "expired", "description"]))
+            page = data.get("users", [])
+            users.extend(page)
+            total = data.get("total")
+            offset += len(page)
+            if not page or (total is not None and offset >= total) or len(page) < page_size:
+                break
+        return users
+
+    def admin_usernames(self):
+        try:
+            data = self.call("SYNO.Core.Group.Member", "list", group="administrators")
+            return {u.get("name") for u in data.get("users", [])}
+        except Exception as e:
+            print(f"  ! Could not list administrators group ({e}); "
+                  f"only excluding built-in 'admin'.")
+            return {"admin"}
+
+    # -- drive: client list -------------------------------------------------
+    def drive_connections(self):
+        last_err = None
+        for api in CANDIDATE_CONNECTION_APIS:
+            if api not in self.apis:
+                continue
+            try:
+                data = self.call(api, "list")
+                for key in ("items", "connections", "list", "clients"):
+                    if key in data:
+                        return data[key]
+                return data if isinstance(data, list) else []
+            except Exception as e:
+                last_err = e
+        if last_err:
+            print(f"  ! Client list unavailable: {last_err}")
+        return []
+
+    # -- drive: log ---------------------------------------------------------
+    def drive_log(self, since_epoch, page_size=1000, max_pages=200):
+        """Page through the Drive Server log, newest first, until since_epoch."""
+        api = next((a for a in CANDIDATE_LOG_APIS if a in self.apis), None)
+        if not api:
+            print("  ! No SYNO.SynologyDrive.Log API found. Run --discover.")
+            return []
+        items, offset = [], 0
+        for _ in range(max_pages):
+            try:
+                data = self.call(api, "list", offset=offset, limit=page_size)
+            except Exception as e:
+                print(f"  ! Drive log page failed at offset {offset}: {e}")
+                break
+            page = None
+            for key in ("items", "logs", "list", "data"):
+                if isinstance(data.get(key), list):
+                    page = data[key]
+                    break
+            if not page:
+                break
+            items.extend(page)
+            # Only stop early if this page actually carried usable timestamps;
+            # a page of unparseable times must not look like "we reached 1970".
+            stamps = [t for t in (pick_int(i, F_TIME) for i in page) if t]
+            offset += len(page)
+            if stamps and min(stamps) < since_epoch:
+                break
+            if len(page) < page_size:
+                break
+        return [i for i in items if (pick_int(i, F_TIME) or 0) >= since_epoch]
+
+    # -- file counts --------------------------------------------------------
+    def dir_stats(self, path, timeout_s=120):
+        """File/folder counts + size via File Station DirSize (async task)."""
+        start = self.call("SYNO.FileStation.DirSize", "start", path=json.dumps([path]))
+        taskid = start.get("taskid")
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            st = self.call("SYNO.FileStation.DirSize", "status", taskid=taskid)
+            if st.get("finished"):
+                return {"files": st.get("num_file"), "dirs": st.get("num_dir"),
+                        "bytes": st.get("total_size")}
+            time.sleep(1.5)
+        return None
+
+    def homes_backup_roots(self, username):
+        """List top-level folders under the user's Drive area, e.g.
+        /homes/<user>/Drive — where Drive Client backup tasks usually land."""
+        for base in (f"/homes/{username}/Drive", f"/homes/{username}"):
+            try:
+                data = self.call("SYNO.FileStation.List", "list",
+                                 folder_path=base, limit=200)
+                return base, [f["name"] for f in data.get("files", [])
+                              if f.get("isdir") and not f["name"].startswith((".", "#"))]
+            except Exception:
+                continue
+        return None, []
+
+
+# ---------------------------------------------------------------------------
+# DSM auth error codes worth explaining rather than printing raw.
+AUTH_ERRORS = {
+    400: "  <- wrong account or password",
+    401: "  <- account disabled",
+    402: "  <- permission denied; the service account must be in the "
+         "administrators group",
+    403: "  <- 2FA/OTP required; this collector cannot log in to an account "
+         "with 2FA enabled",
+    404: "  <- failed 2FA attempts, account temporarily blocked",
+    407: "  <- blocked by DSM auto-block or the firewall; allow the "
+         "container's source IP",
+}
+
+
+def pick(d, keys, default=None):
+    for k in keys:
+        if isinstance(d, dict) and d.get(k) not in (None, ""):
+            return d[k]
+    return default
+
+
+def pick_int(d, keys):
+    v = pick(d, keys)
+    try:
+        v = int(v)
+        # some APIs return ms
+        return v // 1000 if v > 10**12 else v
+    except (TypeError, ValueError):
+        return None
+
+
+def infer_root(path):
+    """'/homes/jsmith/Drive/DESKTOP-J5/Documents/tax/2025.pdf' -> 'Documents'
+    Falls back to the first meaningful segment."""
+    if not path:
+        return None
+    parts = [p for p in str(path).split("/") if p]
+    known = {"desktop", "documents", "downloads", "pictures", "music",
+             "videos", "favorites", "appdata"}
+    for i, seg in enumerate(parts):
+        if seg.lower() in known:
+            return seg
+    # after .../Drive/<Computer>/<root>/...
+    for i, seg in enumerate(parts):
+        if seg.lower() == "drive" and len(parts) > i + 2:
+            return parts[i + 2]
+    return parts[0] if parts else None
+
+
+def status_for(last_success, now):
+    if not last_success:
+        return "never"
+    age_days = (now - last_success) / 86400
+    if age_days <= 2:
+        return "ok"
+    if age_days <= 7:
+        return "stale"
+    return "failing"
+
+
+def collect_nas(cfg, days, want_counts):
+    pw = (cfg.get("password")
+          or os.environ.get(cfg.get("password_env", ""), "")
+          or "")
+    ses = SynoSession(cfg["name"], cfg.get("host", "localhost"),
+                      cfg.get("port", 5000), cfg.get("https", False),
+                      cfg.get("verify_ssl", False), cfg["username"], pw,
+                      base_url=cfg.get("base_url"))
+    print(f"* Connecting to {cfg['name']} ({cfg.get('base_url') or cfg.get('host')}) ...")
+    ses.connect()
+    now = int(time.time())
+    since = now - days * 86400
+    try:
+        admins = ses.admin_usernames()
+        users = [u for u in ses.list_users()
+                 if u.get("name") not in admins and u.get("name") not in ("guest",)]
+        print(f"  {len(users)} non-admin users, admins excluded: {sorted(admins)}")
+
+        conns = ses.drive_connections()
+        devices_by_user = defaultdict(list)
+        for c in conns:
+            uname = pick(c, F_USER)
+            if not uname:
+                continue
+            devices_by_user[uname].append({
+                "name": pick(c, F_DEVICE, default="unknown device"),
+                "last_seen": pick_int(c, ["last_connection_time", "last_seen",
+                                          "connection_time", "time"]),
+                "online": bool(pick(c, ["online", "is_online", "connected"], False)),
+                "type": pick(c, ["client_type", "app", "type"], ""),
+            })
+
+        log = ses.drive_log(since)
+        print(f"  {len(log)} Drive log events in the last {days} days")
+        daily = defaultdict(lambda: defaultdict(int))   # user -> date -> events
+        roots = defaultdict(set)                        # user -> root folders
+        last_success = {}
+        for item in log:
+            uname = pick(item, F_USER)
+            ts = pick_int(item, F_TIME)
+            if not uname or not ts:
+                continue
+            action = str(pick(item, F_ACTION, "")).lower()
+            if action in IGNORE_ACTIONS:
+                continue
+            counts_as_sync = (not action) or any(a in action for a in SYNC_ACTIONS)
+            if not counts_as_sync:
+                continue
+            day = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+            daily[uname][day] += 1
+            last_success[uname] = max(last_success.get(uname, 0), ts)
+            r = infer_root(pick(item, F_PATH))
+            if r:
+                roots[uname].add(r)
+
+        out_users = []
+        for u in sorted(users, key=lambda x: x.get("name", "")):
+            uname = u["name"]
+            root_list = []
+            base = None
+            if not roots[uname]:
+                base, listed = ses.homes_backup_roots(uname)
+                for r in listed:
+                    roots[uname].add(r)
+            for r in sorted(roots[uname]):
+                entry = {"name": r, "files": None}
+                if want_counts:
+                    p = f"{base or f'/homes/{uname}/Drive'}/{r}"
+                    try:
+                        stats = ses.dir_stats(p)
+                        if stats:
+                            entry["files"] = stats["files"]
+                            entry["bytes"] = stats["bytes"]
+                    except Exception:
+                        pass
+                root_list.append(entry)
+
+            # Status comes from file events in the Drive log and nothing else.
+            # Deliberately NO fallback to the client's last-connection time:
+            # a Drive Client that is connected but has silently stopped syncing
+            # is the exact failure this tool exists to catch, and using
+            # last-seen here would report it as healthy. Device last-seen is
+            # still carried in "devices" for display.
+            ls = last_success.get(uname)
+            out_users.append({
+                "username": uname,
+                "display_name": u.get("description") or uname,
+                "devices": devices_by_user.get(uname, []),
+                "roots": root_list,
+                "daily": dict(daily.get(uname, {})),
+                "last_success": ls,
+                "status": status_for(ls, now),
+            })
+        return {"name": cfg["name"], "host": cfg.get("host") or cfg.get("base_url", ""),
+                "users": out_users}
+    finally:
+        ses.logout()
+
+
+def discover(cfg):
+    pw = (cfg.get("password")
+          or os.environ.get(cfg.get("password_env", ""), "")
+          or "")
+    ses = SynoSession(cfg["name"], cfg.get("host", "localhost"),
+                      cfg.get("port", 5000), cfg.get("https", False),
+                      cfg.get("verify_ssl", False), cfg["username"], pw,
+                      base_url=cfg.get("base_url"))
+    ses.connect()
+    try:
+        print(f"\n=== {cfg['name']}: SYNO.SynologyDrive.* APIs exposed ===")
+        found = False
+        for name, info in sorted(ses.apis.items()):
+            if name.startswith("SYNO.SynologyDrive"):
+                found = True
+                print(f"  {name}  v{info.get('minVersion')}-{info.get('maxVersion')}  ({info.get('path')})")
+        if not found:
+            print("  (none — is Synology Drive Server installed on this NAS?)")
+        for api in CANDIDATE_LOG_APIS:
+            if api in ses.apis:
+                try:
+                    data = ses.call(api, "list", offset=0, limit=1)
+                    print(f"\n--- sample response from {api} ---")
+                    print(json.dumps(data, indent=2)[:3000])
+                    print("\nCompare the field names above with F_USER / F_TIME / "
+                          "F_PATH / F_ACTION / F_DEVICE at the top of collector.py.")
+                except Exception as e:
+                    print(f"\n{api} list failed: {e}")
+    finally:
+        ses.logout()
+
+
+# ---------------------------------------------------------------------------
+def _env_bool(name, default=False):
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_password():
+    path = os.environ.get("SYNO_PASS_FILE")
+    if path:
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError as e:
+            sys.exit(f"SYNO_PASS_FILE set but unreadable: {e}")
+    return os.environ.get("SYNO_PASS", "")
+
+
+def config_from_env():
+    """Single-NAS config built from environment variables — the container path."""
+    user = os.environ.get("SYNO_USER")
+    if not user:
+        sys.exit("No config.json found and SYNO_USER is not set. "
+                 "Set SYNO_USER/SYNO_PASS (see README) or provide a config file.")
+    pw = _env_password()
+    if not pw:
+        sys.exit("SYNO_USER is set but no password given "
+                 "(set SYNO_PASS or SYNO_PASS_FILE).")
+    nas = {
+        "name": os.environ.get("SYNO_NAS_NAME") or socket.gethostname(),
+        "host": os.environ.get("SYNO_HOST", "localhost"),
+        "port": int(os.environ.get("SYNO_PORT", "5000")),
+        "https": _env_bool("SYNO_HTTPS", False),
+        "verify_ssl": _env_bool("SYNO_VERIFY_SSL", False),
+        "username": user,
+        "password": pw,
+    }
+    if os.environ.get("SYNO_BASE_URL"):
+        nas["base_url"] = os.environ["SYNO_BASE_URL"]
+    return {
+        "days": int(os.environ.get("SYNO_DAYS", "90")),
+        "output": os.environ.get("SYNO_OUTPUT", "web/data.json"),
+        "file_counts": _env_bool("SYNO_FILE_COUNTS", False),
+        "nases": [nas],
+    }
+
+
+def load_config(path):
+    if path and os.path.exists(path):
+        with open(path) as f:
+            cfg = json.load(f)
+        if not cfg.get("nases"):
+            sys.exit(f"{path} has no 'nases' entries.")
+        return cfg
+    return config_from_env()
+
+
+def run_once(cfg, days, output, want_counts):
+    result = {"generated_at": int(time.time()), "days": days, "nases": []}
+    ok = True
+    for nas in cfg["nases"]:
+        try:
+            result["nases"].append(collect_nas(nas, days, want_counts))
+        except Exception as e:
+            ok = False
+            print(f"! FAILED {nas.get('name')}: {e}")
+            result["nases"].append({"name": nas.get("name"),
+                                    "host": nas.get("host"),
+                                    "error": str(e), "users": []})
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    # Write via a temp file so the dashboard never fetches a half-written JSON.
+    tmp = output + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(result, f, indent=1)
+    os.replace(tmp, output)
+    print(f"Wrote {output}")
+    return ok
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Synology Drive backup status collector")
+    ap.add_argument("-c", "--config", default="config.json")
+    ap.add_argument("-o", "--output", default=None,
+                    help="override output path (default from config/env, else web/data.json)")
+    ap.add_argument("--days", type=int, default=None, help="history window")
+    ap.add_argument("--file-counts", action="store_true",
+                    help="also compute per-root file counts (slower)")
+    ap.add_argument("--discover", action="store_true",
+                    help="print available Drive APIs + a sample log entry, then exit")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    days = args.days or cfg.get("days", 90)
+    output = args.output or cfg.get("output", "web/data.json")
+    want_counts = args.file_counts or cfg.get("file_counts", False)
+
+    if args.discover:
+        for nas in cfg["nases"]:
+            discover(nas)
+        return
+
+    sys.exit(0 if run_once(cfg, days, output, want_counts) else 1)
+
+
+if __name__ == "__main__":
+    main()
