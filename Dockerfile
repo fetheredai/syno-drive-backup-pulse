@@ -17,6 +17,8 @@ ENV PYTHONUNBUFFERED=1 \
     SYNO_PORT=5000 \
     SYNO_HTTPS=false \
     SYNO_VERIFY_SSL=false \
+    SYNO_AUTH=true \
+    SYNO_SESSION_HOURS=12 \
     SYNO_DAYS=90
 
 WORKDIR /app
@@ -24,7 +26,8 @@ WORKDIR /app
 # requests is the only runtime dependency
 RUN pip install --no-cache-dir requests==2.32.3
 
-COPY collector.py app.py ./
+COPY collector.py app.py auth.py ./
+COPY probe.py probe2.py ./
 COPY web/ ./web/
 
 # Non-root. web/ must stay writable — that's where data.json lands.

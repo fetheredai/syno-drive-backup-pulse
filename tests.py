@@ -218,5 +218,91 @@ class UnitBits(unittest.TestCase):
             srv.shutdown()
 
 
+class DashboardLogin(unittest.TestCase):
+    """Login is verified against DSM itself, so there is no second password
+    store. These cover the cases that decide who gets in."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = _free_port()
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", cls.port), mock_dsm.Handler)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        os.environ.update({
+            "SYNO_HOST": "127.0.0.1", "SYNO_PORT": str(cls.port),
+            "SYNO_HTTPS": "false",
+            "SYNO_USER": "svc-drivemonitor", "SYNO_PASS": "s3cret",
+        })
+        global auth
+        import auth
+        auth.LOGIN_GROUP = ""
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def setUp(self):
+        auth._fails.clear()
+        auth._group_cache.clear()
+        auth.LOGIN_GROUP = ""
+
+    def test_valid_dsm_credentials_are_accepted(self):
+        ok, msg = auth.check_credentials("alice", "alicepw")
+        self.assertTrue(ok, msg)
+
+    def test_wrong_password_rejected(self):
+        ok, msg = auth.check_credentials("alice", "wrong")
+        self.assertFalse(ok)
+        self.assertIn("Incorrect", msg)
+
+    def test_blank_input_rejected(self):
+        self.assertFalse(auth.check_credentials("", "")[0])
+
+    def test_two_factor_account_gets_a_specific_message(self):
+        """DSM returns 403 for an OTP-protected account. Saying 'incorrect
+        password' would send someone chasing the wrong problem."""
+        ok, msg = auth.check_credentials("twofa", "twofapw")
+        self.assertFalse(ok)
+        self.assertIn("2-factor", msg)
+
+    def test_group_restriction_allows_members(self):
+        auth.LOGIN_GROUP = mock_dsm.VIEWER_GROUP
+        self.assertTrue(auth.check_credentials("alice", "alicepw")[0])
+
+    def test_group_restriction_blocks_non_members(self):
+        auth.LOGIN_GROUP = mock_dsm.VIEWER_GROUP
+        ok, msg = auth.check_credentials("carol", "carolpw")
+        self.assertFalse(ok)
+        self.assertIn(mock_dsm.VIEWER_GROUP, msg)
+
+    def test_group_check_fails_closed(self):
+        """If membership cannot be confirmed, access must be denied — a
+        restriction that opens up when the lookup breaks is decorative."""
+        auth.LOGIN_GROUP = "NoSuchGroup"
+        ok, msg = auth.check_credentials("alice", "alicepw")
+        self.assertFalse(ok)
+        self.assertIn("Could not verify", msg)
+
+    def test_repeated_failures_are_throttled(self):
+        """Hammering DSM's login endpoint can trip its auto-block and lock out
+        the source address, so stop before DSM does."""
+        for _ in range(auth.MAX_FAILS):
+            auth.check_credentials("alice", "wrong")
+        ok, msg = auth.check_credentials("alice", "alicepw")
+        self.assertFalse(ok, "correct password should still be throttled")
+        self.assertIn("Too many failed attempts", msg)
+
+    def test_sessions_expire_and_can_be_ended(self):
+        token = auth.new_session("alice")
+        self.assertEqual(auth.session_user(token), "alice")
+        auth.end_session(token)
+        self.assertIsNone(auth.session_user(token))
+        self.assertIsNone(auth.session_user("not-a-real-token"))
+
+    def test_login_page_escapes_error_text(self):
+        html = auth.login_page('<script>alert(1)</script>').decode()
+        self.assertNotIn("<script>alert", html)
+        self.assertIn("&lt;script&gt;", html)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

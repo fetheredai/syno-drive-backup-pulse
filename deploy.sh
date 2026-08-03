@@ -6,45 +6,42 @@
 # ghcr.io cannot usefully be added under the Docker package's Registry tab.
 # This script does the whole thing with plain `docker` over SSH instead.
 #
-#   sudo ./deploy.sh              prompts for anything it needs
-#   sudo ./deploy.sh --show       print the current container's health
+#   sudo ./deploy.sh                first run: asks, then remembers
+#   sudo ./deploy.sh                later runs: no prompts, just updates
+#   sudo ./deploy.sh --reconfigure  change the saved answers
+#   sudo ./deploy.sh --show         print the current container's health
 #
 # CREDENTIALS
-#   By default the script prompts and passes the password to the container as
-#   an environment variable — the same place every other Synology container
-#   keeps its passwords. Nothing is written to disk by this script, but the
-#   value is stored in Docker's own container config and is visible to root
-#   via `docker inspect`.
+#   Asked once, then stored in a root-only 0600 file next to this script and
+#   mounted read-only into the container, so `docker inspect` shows a path
+#   rather than the password. Re-running needs no re-entry.
 #
-#   SECRET_MODE=file instead writes the password to a root-only 0600 file and
-#   mounts it read-only, so `docker inspect` shows only a path:
-#       sudo SECRET_MODE=file ./deploy.sh
+#   SECRET_MODE=env passes it as an environment variable instead — the same
+#   place other Synology containers keep passwords, but visible to root via
+#   `docker inspect`.
 #
-#   Either way, re-running this script is how you update the site.
+#   Non-secret answers live in .pulse-config beside this script.
 
 set -euo pipefail
 
-# Print something immediately. If this banner does not appear, the script did
-# not run at all — an empty or truncated copy exits 0 silently, which is
-# indistinguishable from "nothing happened".
 echo "Backup Pulse deploy — $(date '+%Y-%m-%d %H:%M:%S')"
-
-# DEBUG=1 ./deploy.sh  traces every command.
 [ "${DEBUG:-0}" = "1" ] && set -x
 
 cd "$(dirname "$0")"
 
 NAME="${CONTAINER_NAME:-backup-pulse}"
 ENV_FILE="${ENV_FILE:-.env}"
-SECRET_MODE="${SECRET_MODE:-env}"
+CONFIG_FILE="${CONFIG_FILE:-.pulse-config}"
+SECRET_MODE="${SECRET_MODE:-file}"
 SECRET_FILE="${SECRET_FILE:-$PWD/.pulse-secret}"
 DEFAULT_IMAGE="ghcr.io/fetheredai/syno-drive-backup-pulse:latest"
 
-# --- optional .env --------------------------------------------------------
-# Entirely optional. Useful for unattended re-deploys; skip it and the script
-# asks instead. Docker .env files leave values unquoted, so a line like
-#     SYNO_NAS_NAME=Acme Co - DS923+
-# would make `source` try to execute `Co`. Parse it by hand.
+MODE="${1:-}"
+
+# --- reading saved answers -------------------------------------------------
+# Parsed by hand rather than sourced: these files leave values unquoted, so a
+# line like  SYNO_NAS_NAME=Acme Co - DS923+  would make `source` run `Co`.
+# Values already in the environment win, so one-off overrides work.
 load_env() {
   local line key val
   while IFS= read -r line || [ -n "$line" ]; do
@@ -63,9 +60,10 @@ load_env() {
     [ -z "${!key:-}" ] && export "$key=$val"
   done < "$1"
 }
+[ -f "$CONFIG_FILE" ] && load_env "$CONFIG_FILE"
 [ -f "$ENV_FILE" ] && load_env "$ENV_FILE"
 
-# --- docker ---------------------------------------------------------------
+# --- docker ----------------------------------------------------------------
 # DSM puts the docker binary in /usr/local/bin, which sudo's secure_path does
 # not always include, so a bare `docker` can be "not found" under sudo even
 # though the package is running. Probe the known locations.
@@ -81,7 +79,6 @@ for cand in docker /usr/local/bin/docker /usr/bin/docker \
     DOCKER_SEEN="$cand"
   fi
 done
-
 if [ -z "$DOCKER" ]; then
   if [ -n "${DOCKER_SEEN:-}" ]; then
     echo "Found the docker binary at $DOCKER_SEEN but could not talk to the" >&2
@@ -99,16 +96,16 @@ WEB_PORT="${SYNO_WEB_PORT:-8477}"
 
 health() {
   $DOCKER exec "$NAME" python3 -c \
-    "import urllib.request,sys;print(urllib.request.urlopen('http://127.0.0.1:${WEB_PORT}/healthz',timeout=4).read().decode())" \
+    "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:${WEB_PORT}/healthz',timeout=4).read().decode())" \
     2>/dev/null || true
 }
 
-if [ "${1:-}" = "--show" ]; then
+if [ "$MODE" = "--show" ]; then
   health
   exit 0
 fi
 
-# --- gather what we need --------------------------------------------------
+# --- gather what we need ---------------------------------------------------
 PULSE_IMAGE="${PULSE_IMAGE:-$DEFAULT_IMAGE}"
 
 ask() {                       # ask VAR "prompt" "default"
@@ -116,7 +113,7 @@ ask() {                       # ask VAR "prompt" "default"
   [ -n "${!var:-}" ] && return 0
   if [ ! -t 0 ]; then
     echo "$var is not set and there is no terminal to ask on. Set it in the" >&2
-    echo "environment or in $ENV_FILE, e.g.  SYNO_USER=svc-drivemonitor" >&2
+    echo "environment or in $CONFIG_FILE, e.g.  SYNO_USER=svc-drivemonitor" >&2
     exit 1
   fi
   if [ -n "$default" ]; then
@@ -129,12 +126,53 @@ ask() {                       # ask VAR "prompt" "default"
   export "${var?}"
 }
 
-ask SYNO_NAS_NAME "Client / NAS name shown in the dashboard" "$(hostname)"
-ask SYNO_USER     "DSM service account (admin group, no 2FA)" "svc-drivemonitor"
+ask_optional() {              # ask_optional VAR "prompt"  (blank allowed)
+  local var="$1" prompt="$2" reply
+  if [ ! -t 0 ]; then export "${var}=${!var:-}"; return 0; fi
+  read -r -p "$prompt: " reply
+  printf -v "$var" '%s' "$reply"
+  export "${var?}"
+}
 
-if [ -z "${SYNO_PASS:-}" ]; then
+FIRST_RUN=0
+if [ "${PULSE_CONFIGURED:-}" != "1" ] || [ "$MODE" = "--reconfigure" ]; then
+  FIRST_RUN=1
+  if [ "$MODE" = "--reconfigure" ]; then
+    unset SYNO_NAS_NAME SYNO_USER SYNO_INCLUDE_GROUPS SYNO_LOGIN_GROUP SYNO_AUTH
+  fi
+  ask SYNO_NAS_NAME "Client / NAS name shown in the dashboard" "$(hostname)"
+  ask SYNO_USER     "DSM service account (admin group, no 2FA)" "svc-drivemonitor"
+  echo
+  echo "Only show users in particular DSM groups? Comma-separated, blank for all."
+  echo "  e.g. SynologyDriveUsers"
+  ask_optional SYNO_INCLUDE_GROUPS "  Groups to include"
+  echo
+  echo "Require sign-in with a DSM account to view the dashboard? [Y/n]"
+  read -r _auth_reply || true
+  case "${_auth_reply:-y}" in [Nn]*) SYNO_AUTH=false ;; *) SYNO_AUTH=true ;; esac
+  export SYNO_AUTH
+  if [ "$SYNO_AUTH" = "true" ]; then
+    echo "  Limit sign-in to members of a DSM group? Blank for any DSM account."
+    ask_optional SYNO_LOGIN_GROUP "  Group allowed to sign in"
+  fi
+  echo
+else
+  echo "==> using saved settings from $CONFIG_FILE (--reconfigure to change)"
+fi
+
+# --- the password ----------------------------------------------------------
+NEED_PASSWORD=1
+if [ "$SECRET_MODE" = "file" ] && [ -s "$SECRET_FILE" ] && [ "$MODE" != "--reconfigure" ]; then
+  NEED_PASSWORD=0
+  echo "==> reusing the saved service-account password ($SECRET_FILE)"
+fi
+if [ -n "${SYNO_PASS:-}" ]; then
+  NEED_PASSWORD=0
+fi
+
+if [ "$NEED_PASSWORD" = "1" ]; then
   if [ ! -t 0 ]; then
-    echo "SYNO_PASS is not set and there is no terminal to prompt on." >&2
+    echo "No stored password and no terminal to prompt on. Set SYNO_PASS." >&2
     exit 1
   fi
   # Confirm on entry: a mistyped password means repeated failed logins, and
@@ -149,20 +187,43 @@ if [ -z "${SYNO_PASS:-}" ]; then
   export SYNO_PASS
 fi
 
-# --- how the secret reaches the container ---------------------------------
 SECRET_ARGS=()
 if [ "$SECRET_MODE" = "file" ]; then
-  umask 077
-  printf '%s' "$SYNO_PASS" > "$SECRET_FILE"
-  chmod 600 "$SECRET_FILE"
+  if [ -n "${SYNO_PASS:-}" ]; then
+    umask 077
+    printf '%s' "$SYNO_PASS" > "$SECRET_FILE"
+    chmod 600 "$SECRET_FILE"
+  fi
   SECRET_ARGS=(-v "$SECRET_FILE:/run/secrets/syno_pass:ro"
                -e SYNO_PASS_FILE=/run/secrets/syno_pass)
-  echo "==> password written to $SECRET_FILE (0600) and mounted read-only"
 else
   SECRET_ARGS=(-e SYNO_PASS="$SYNO_PASS")
 fi
 
-# --- deploy ---------------------------------------------------------------
+# --- remember the non-secret answers ---------------------------------------
+if [ "$FIRST_RUN" = "1" ]; then
+  umask 077
+  cat > "$CONFIG_FILE" <<EOF
+# Written by deploy.sh. Non-secret settings; the password is in $SECRET_FILE.
+# Re-run with --reconfigure to change these.
+PULSE_CONFIGURED=1
+PULSE_IMAGE=$PULSE_IMAGE
+SYNO_NAS_NAME=$SYNO_NAS_NAME
+SYNO_USER=$SYNO_USER
+SYNO_INCLUDE_GROUPS=${SYNO_INCLUDE_GROUPS:-}
+SYNO_AUTH=${SYNO_AUTH:-true}
+SYNO_LOGIN_GROUP=${SYNO_LOGIN_GROUP:-}
+SYNO_EXCLUDE_USERS=${SYNO_EXCLUDE_USERS:-}
+SYNO_DAYS=${SYNO_DAYS:-90}
+SYNO_INTERVAL_HOURS=${SYNO_INTERVAL_HOURS:-4}
+SYNO_FILE_COUNTS=${SYNO_FILE_COUNTS:-false}
+SYNO_WEB_PORT=$WEB_PORT
+EOF
+  chmod 600 "$CONFIG_FILE"
+  echo "==> settings saved to $CONFIG_FILE"
+fi
+
+# --- deploy ----------------------------------------------------------------
 echo "==> pulling $PULSE_IMAGE"
 $DOCKER pull "$PULSE_IMAGE"
 
@@ -188,12 +249,15 @@ $DOCKER run -d \
   -e SYNO_DAYS="${SYNO_DAYS:-90}" \
   -e SYNO_INTERVAL_HOURS="${SYNO_INTERVAL_HOURS:-4}" \
   -e SYNO_FILE_COUNTS="${SYNO_FILE_COUNTS:-false}" \
+  -e SYNO_INCLUDE_GROUPS="${SYNO_INCLUDE_GROUPS:-}" \
+  -e SYNO_EXCLUDE_USERS="${SYNO_EXCLUDE_USERS:-}" \
+  -e SYNO_AUTH="${SYNO_AUTH:-true}" \
+  -e SYNO_LOGIN_GROUP="${SYNO_LOGIN_GROUP:-}" \
+  -e SYNO_SESSION_HOURS="${SYNO_SESSION_HOURS:-12}" \
   -e SYNO_WEB_PORT="$WEB_PORT" \
   "$PULSE_IMAGE" >/dev/null
 
-# --- verify the credentials actually worked -------------------------------
-# Worth doing here rather than leaving them to discover it later: a bad
-# password otherwise shows up only as an empty dashboard.
+# --- verify the credentials actually worked --------------------------------
 echo -n "==> waiting for the first collection"
 status=""
 for _ in $(seq 1 40); do
@@ -217,23 +281,25 @@ else
   echo >&2
   echo "Most likely: wrong password, the account is not in the administrators" >&2
   echo "group, or it has 2FA enabled. Full detail: $DOCKER logs $NAME" >&2
+  echo "Re-enter the password with: sudo ./deploy.sh --reconfigure" >&2
 fi
 
-echo
-# The deploy itself usually runs under sudo, so $DOCKER is a bare `docker`.
-# The operator will run these follow-ups as themselves, where the socket is
-# root-only — so the hints need sudo even though we did not.
+# The deploy usually runs under sudo, so $DOCKER is a bare `docker`, but these
+# follow-ups get run unprivileged where the socket is root-only.
 HINT="$DOCKER"
 if [ "$(id -u)" = "0" ] && [ "$HINT" = "${HINT#sudo }" ]; then
   HINT="sudo $DOCKER"
 fi
-# Resolve a real address instead of printing a literal placeholder.
 NAS_IP="$(ip route get 1 2>/dev/null | awk '{print $7; exit}')"
 [ -z "$NAS_IP" ] && NAS_IP="$(hostname -i 2>/dev/null | awk '{print $1}')"
 [ -z "$NAS_IP" ] && NAS_IP="<nas-ip>"
-echo "  dashboard  http://${NAS_IP}:${WEB_PORT}/"
-echo "  health     $HINT exec $NAME python3 -c \"import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:${WEB_PORT}/healthz').read().decode())\""
-echo "  logs       $HINT logs -f $NAME"
+
 echo
-echo "Validate the Drive API field mappings before trusting the numbers:"
-echo "  $HINT exec $NAME python3 collector.py --discover"
+echo "  dashboard  http://${NAS_IP}:${WEB_PORT}/"
+if [ "${SYNO_AUTH:-true}" = "true" ]; then
+  echo "             sign in with a DSM account\
+${SYNO_LOGIN_GROUP:+ in group $SYNO_LOGIN_GROUP}"
+fi
+echo "  logs       $HINT logs -f $NAME"
+echo "  update     sudo ./deploy.sh          (no prompts)"
+echo "  change     sudo ./deploy.sh --reconfigure"

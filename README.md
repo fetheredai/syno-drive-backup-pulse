@@ -76,15 +76,24 @@ cd /volume1/docker/backup-pulse
 sudo ./deploy.sh
 ```
 
-It asks for the client name, the service account and its password, pulls the
-image, replaces any previous container, starts the new one with host
-networking and a restart policy, then waits for the first collection and tells
-you whether it actually succeeded. Re-run the same command to update the site
-later.
+The first run asks for the client name, the service account, its password,
+which groups to show, and whether to require sign-in. It then pulls the image,
+replaces any previous container, starts the new one with host networking and a
+restart policy, waits for the first collection and tells you whether it
+actually succeeded.
 
-No `.env` is required. If one is present it is used for any value you have not
-already set in the environment, which is handy for unattended re-deploys, but
-it is entirely optional.
+Those answers are remembered, so **later runs need no input at all**:
+
+```
+sudo ./deploy.sh                 # update this site, no prompts
+sudo ./deploy.sh --reconfigure   # change the saved answers
+sudo ./deploy.sh --show          # current health, no redeploy
+```
+
+The password is stored in a root-only `0600` file beside the script and
+mounted read-only into the container, so `docker inspect` shows a path rather
+than the password. Non-secret answers live in `.pulse-config` next to it.
+`SECRET_MODE=env` passes the password as an environment variable instead.
 
 Upgrading DSM to 7.2+ gets you Container Manager and the compose workflow
 above, which is nicer to operate. `deploy.sh` keeps working either way, so
@@ -97,17 +106,18 @@ username and password is the only way in. Collection has to keep running
 unattended across reboots, so something has to hold that credential. There are
 three options, in increasing order of paranoia:
 
-**Prompted, passed as an environment variable (the `deploy.sh` default).**
-Nothing is written to disk. The value ends up in Docker's own container config
-and is visible to root via `docker inspect` — which is exactly where every
-other Synology container keeps its passwords, so this matches normal practice
-on the platform.
+**Prompted once, stored in a root-only file (the `deploy.sh` default).** The
+password goes to a `0600` file beside the script, bind-mounted read-only into
+the container with `SYNO_PASS_FILE` pointing at it — so `docker inspect` shows
+a path rather than the password. Because it persists, re-deploying and
+updating need no re-entry.
 
-**Prompted, stored in a root-only file and mounted read-only.** Run
-`sudo SECRET_MODE=file ./deploy.sh`. The password goes to a `0600` file that is
-bind-mounted into the container, and `SYNO_PASS_FILE` points at it, so
-`docker inspect` shows only a path. Better if several people have shell access
-to the NAS.
+**Prompted, passed as an environment variable.** Run
+`sudo SECRET_MODE=env ./deploy.sh`. Nothing is written to disk by the script,
+but the value lands in Docker's own container config and is visible to root
+via `docker inspect` — which is where every other Synology container keeps its
+passwords, so this matches normal practice on the platform. It also means
+re-entering the password on every deploy.
 
 **A `.env` file.** Convenient for unattended re-deploys across many sites, at
 the cost of a plaintext credential on disk that you manage. If you use one,
@@ -118,10 +128,53 @@ Whichever you choose, limit the blast radius at the DSM end: the service
 account needs the administrators group, but you can still restrict it by
 source IP under Control Panel > Security > Firewall.
 
+## Signing in
+
+The dashboard requires a login by default, and verifies it against DSM itself:
+staff sign in with the Synology account they already have. There is no second
+password store to maintain, and removing someone's DSM account removes their
+access here too.
+
+Restrict it further with `SYNO_LOGIN_GROUP=DriveViewers` — only members of that
+DSM group can sign in. Membership is checked with the service account and
+fails closed: if the group cannot be read, access is denied rather than
+granted.
+
+Two caveats. An account with 2FA enabled cannot sign in, because the collector
+has no OTP handling; the login page says so explicitly rather than claiming a
+bad password. And this server speaks plain HTTP, so on anything less trusted
+than a VPN put a reverse proxy with TLS in front of it — the session cookie is
+`HttpOnly` and `SameSite=Lax`, but it is not encrypted in transit.
+
+Repeated failures are throttled per account, because hammering DSM's login
+endpoint can trip its auto-block and lock out the source address.
+
+Set `SYNO_AUTH=false` to turn login off entirely on a trusted network.
+
+## Choosing which users appear
+
+By default every non-admin DSM account shows up, which on an established NAS
+means a lot of dormant accounts. Two controls:
+
+`SYNO_INCLUDE_GROUPS=SynologyDriveUsers` limits the dashboard to members of one
+or more DSM groups (comma-separated). Create the group in DSM, put the people
+who should be backing up in it, and the dashboard follows. If a configured
+group cannot be read at all, the collector shows everyone and says so rather
+than silently presenting an empty dashboard — an empty dashboard reads as
+"nothing is wrong", which is the worst thing this tool could imply.
+
+`SYNO_EXCLUDE_USERS=GuestAccount,kiosk` drops specific accounts by name.
+
+Users are also classified: an account with no Drive client at all is `unused`
+rather than `never`, and the dashboard hides those behind a chip. `never` is
+reserved for someone who has a client but has never actually backed anything
+up — which is worth investigating.
+
 ## Configuration
 
-Everything is environment variables. `deploy.sh` prompts for the essential
-ones; the rest have defaults. They can also be set in an optional `.env`:
+Everything is environment variables. `deploy.sh` asks for the essentials once
+and remembers them; the rest have defaults. They can also be set in an
+optional `.env`:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -138,6 +191,12 @@ ones; the rest have defaults. They can also be set in an optional `.env`:
 | `SYNO_INTERVAL_HOURS` | `4` | How often to collect |
 | `SYNO_FILE_COUNTS` | `false` | Count files per root folder (slow) |
 | `SYNO_WEB_PORT` | `8477` | Dashboard port |
+| `SYNO_AUTH` | `true` | Require sign-in to view the dashboard |
+| `SYNO_LOGIN_GROUP` | — | Only this DSM group may sign in |
+| `SYNO_SESSION_HOURS` | `12` | How long a session lasts |
+| `SYNO_INCLUDE_GROUPS` | — | Only show members of these DSM groups |
+| `SYNO_EXCLUDE_USERS` | — | Hide these accounts by name |
+| `SYNO_MAX_LOG_PAGES` | `500` | Log paging cap; raise for very busy servers |
 
 ### Why the defaults talk to localhost over plain HTTP
 

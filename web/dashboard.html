@@ -82,6 +82,10 @@
   .cell.l3{background:var(--c3)} .cell.l4{background:var(--c4)}
   .cell.future{background:transparent}
   .cell:hover{outline:1.5px solid var(--ink);outline-offset:1px}
+  /* Today is the column people look for first, so mark it explicitly rather
+     than relying on "it's the last one". */
+  .cell.today{box-shadow:0 0 0 1.5px var(--accent)}
+  .months span.todaylab{color:var(--accent);font-weight:600}
 
   .nasblock{margin:26px 2px 8px;display:flex;align-items:baseline;gap:10px}
   .nasblock h2{margin:0;font-size:15px;font-weight:700}
@@ -230,6 +234,7 @@ function render(){
   const monthMarks = [];
   dayKeys.forEach((k,i)=>{ if (k.endsWith('-01') || i===0)
       monthMarks.push({i, lab: new Date(k+'T00:00').toLocaleString(undefined,{month:'short'})}); });
+  monthMarks.push({i: dayKeys.length-1, lab:'today', cls:'todaylab'});
 
   const order = {failing:0, never:1, stale:2, ok:3, unused:4};
   const content = document.getElementById('content'); content.innerHTML='';
@@ -249,7 +254,8 @@ function render(){
     const wall = document.createElement('div'); wall.className='wall';
     // axis
     const axis = document.createElement('div'); axis.className='axisrow';
-    const monthsHtml = monthMarks.map(m=>`<span style="left:${m.i*13}px">${m.lab}</span>`).join('');
+    const monthsHtml = monthMarks.map(m=>
+      `<span class="${m.cls||''}" style="left:${Math.max(0,m.i*13-18)}px">${m.lab}</span>`).join('');
     axis.innerHTML = `<div class="lab">user / backup roots</div>
       <div class="strip-wrap"><div class="months">${monthsHtml}</div></div>`;
     wall.appendChild(axis);
@@ -266,10 +272,11 @@ function render(){
       const rootsHtml = (u.roots||[]).map(r=>
         `<span class="root">${r.name}${r.files!=null?`<b>${fmtN(r.files)}</b>`:''}</span>`).join('')
         || '<span class="root" style="color:var(--muted)">no folders detected</span>';
-      const cells = dayKeys.map(k=>{
+      const cells = dayKeys.map((k,i)=>{
         const v = (u.daily||{})[k]||0;
         const lvl = v===0?'':v<25?'l1':v<100?'l2':v<400?'l3':'l4';
-        return `<span class="cell ${lvl}" data-d="${k}" data-v="${v}"></span>`;
+        const today = (i===dayKeys.length-1) ? ' today' : '';
+        return `<span class="cell ${lvl}${today}" data-d="${k}" data-v="${v}"></span>`;
       }).join('');
       row.innerHTML = `
         <div class="who">
@@ -283,6 +290,8 @@ function render(){
     });
     content.appendChild(wall);
   });
+
+  snapToToday();
 }
 
 /* ---------- tooltip ------------------------------------------------------ */
@@ -306,14 +315,30 @@ document.getElementById('q').addEventListener('input', e=>{ filt.q=e.target.valu
    moment anyone scrolls sideways — the calendar would start lying. One
    capturing listener keeps every strip on the same scrollLeft. */
 let _syncing = false;
+let userScroll = null;   /* null until the user scrolls for themselves */
 document.addEventListener('scroll', e=>{
   const el = e.target;
   if (!(el instanceof HTMLElement) || !el.classList.contains('strip-wrap')) return;
   if (_syncing) return;
   _syncing = true;
+  userScroll = el.scrollLeft;
   document.querySelectorAll('.strip-wrap').forEach(o=>{ if (o!==el) o.scrollLeft = el.scrollLeft; });
   _syncing = false;
 }, true);
+
+/* The 90-day strip is wider than the window and today sits at the far right,
+   so an unscrolled view opens on three-month-old history — the least useful
+   thing on the page. Snap to today on load, but never fight a user who has
+   scrolled somewhere deliberately. */
+function snapToToday(){
+  requestAnimationFrame(()=>{
+    _syncing = true;
+    document.querySelectorAll('.strip-wrap').forEach(el=>{
+      el.scrollLeft = (userScroll === null) ? el.scrollWidth : userScroll;
+    });
+    _syncing = false;
+  });
+}
 
 /* Pin the month axis directly beneath the real header, whatever height it is. */
 const setHeaderH = () => document.documentElement.style

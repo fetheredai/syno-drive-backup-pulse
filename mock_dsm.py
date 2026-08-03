@@ -41,6 +41,13 @@ ADMINS = {"admin", "awhite"}
 EXTRA_USERS = ["frank", "gina"]
 ROOTS = ["Desktop", "Documents", "Downloads"]
 
+# Accounts that can authenticate, for exercising dashboard login.
+ACCOUNTS = {"svc-drivemonitor": "s3cret", "alice": "alicepw", "carol": "carolpw",
+            "twofa": "twofapw"}
+TWO_FACTOR_ACCOUNTS = {"twofa"}      # DSM returns 403 for these
+VIEWER_GROUP = "DriveViewers"
+VIEWER_MEMBERS = {"alice"}
+
 TYPE_FILE = 13      # observed on real hardware for file events
 TYPE_AUTH = 1       # non-file event; carries no s1 path
 
@@ -182,8 +189,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if api == "SYNO.API.Auth":
             if method == "login":
-                if q.get("account") != "svc-drivemonitor" or q.get("passwd") != "s3cret":
+                if ACCOUNTS.get(q.get("account")) != q.get("passwd"):
                     return self._err(400)
+                if q.get("account") in TWO_FACTOR_ACCOUNTS:
+                    return self._err(403)      # OTP required
                 return self._ok({"sid": SID})
             return self._ok({})
 
@@ -196,8 +205,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._ok(users_payload(offset, limit))
 
         if api == "SYNO.Core.Group.Member":
-            return self._ok({"users": [{"name": n} for n in sorted(ADMINS)],
-                             "total": len(ADMINS)})
+            group = q.get("group")
+            if group == VIEWER_GROUP:
+                return self._ok({"users": [{"name": n} for n in sorted(VIEWER_MEMBERS)],
+                                 "total": len(VIEWER_MEMBERS)})
+            if group == "administrators":
+                return self._ok({"users": [{"name": n} for n in sorted(ADMINS)],
+                                 "total": len(ADMINS)})
+            return self._err(105)          # no such group
 
         if api == "SYNO.SynologyDrive.Connection":
             return self._ok(connections_payload())

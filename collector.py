@@ -202,10 +202,24 @@ class SynoSession:
                 break
         return users
 
+    def group_members(self, group, page_size=500, max_pages=20):
+        """Usernames in a DSM group. Raises if the group cannot be read."""
+        members, offset = set(), 0
+        for _ in range(max_pages):
+            data = self.call("SYNO.Core.Group.Member", "list", group=group,
+                             offset=offset, limit=page_size)
+            page = data.get("users", [])
+            members |= {u.get("name") for u in page if u.get("name")}
+            total = data.get("total")
+            offset += len(page)
+            if not page or (total is not None and offset >= total) \
+                    or len(page) < page_size:
+                break
+        return members
+
     def admin_usernames(self):
         try:
-            data = self.call("SYNO.Core.Group.Member", "list", group="administrators")
-            return {u.get("name") for u in data.get("users", [])}
+            return self.group_members("administrators")
         except Exception as e:
             print(f"  ! Could not list administrators group ({e}); "
                   f"only excluding built-in 'admin'.")
@@ -430,6 +444,39 @@ def collect_nas(cfg, days, want_counts):
         users = [u for u in ses.list_users()
                  if u.get("name") not in admins
                  and str(u.get("name", "")).lower() not in excluded]
+
+        # Restrict to DSM groups, e.g. SYNO_INCLUDE_GROUPS="SynologyDriveUsers".
+        # Keeps long-dead accounts out of the dashboard without touching DSM.
+        include_groups = [g.strip() for g in
+                          os.environ.get("SYNO_INCLUDE_GROUPS", "").split(",")
+                          if g.strip()]
+        if include_groups:
+            allowed, resolved = set(), 0
+            for g in include_groups:
+                try:
+                    members = ses.group_members(g)
+                    allowed |= members
+                    resolved += 1
+                    print(f"  group '{g}': {len(members)} members")
+                except Exception as e:
+                    print(f"  ! Could not read group '{g}': {e}")
+            if resolved:
+                before = len(users)
+                users = [u for u in users if u.get("name") in allowed]
+                print(f"  restricted to {include_groups}: "
+                      f"{len(users)} of {before} users")
+                if not users:
+                    # An empty dashboard reads as "nothing wrong", which is the
+                    # most dangerous thing this tool could imply.
+                    print("  ! The group filter matched NO users. The "
+                          "dashboard will be empty — check the group name and "
+                          "that it has members.")
+            else:
+                # Every group lookup failed — a typo'd name would otherwise
+                # empty the dashboard and look like "all backups are fine".
+                print("  ! No configured group could be read; showing ALL "
+                      "users rather than an empty dashboard. Check "
+                      "SYNO_INCLUDE_GROUPS.")
         print(f"  {len(users)} non-admin users, admins excluded: {sorted(admins)}")
 
         conns = ses.drive_connections()

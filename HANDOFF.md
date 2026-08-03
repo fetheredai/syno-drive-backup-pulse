@@ -19,8 +19,12 @@ secondary mode.
 
 ## Current state
 
-Packaged and tested against a mock DSM. **Still not validated against real
-Drive Server hardware** — see "Outstanding" below.
+**Live on the pilot NAS (BNO-Rackstation, DSM 7.0.1, Atom C3538).** The Drive
+API mappings are validated against real hardware; mock_dsm.py reproduces the
+real payloads. First live run found one failing and one stale backup among 5
+users with Drive clients, out of 80 DSM accounts.
+
+Has login (DSM-backed), DSM-group filtering, and zero-prompt redeploys.
 
 ## Files
 
@@ -41,7 +45,13 @@ Drive Server hardware** — see "Outstanding" below.
   image path from `PULSE_IMAGE` in `.env` rather than hardcoding an owner.
 - `deploy.sh` — SSH deployment for DSM 7.0/7.1, which have the legacy Docker
   package with no Project tab and therefore no GUI compose. Plain `docker run`,
-  no compose dependency. Also the update mechanism on those sites.
+  no compose dependency. Also the update mechanism on those sites. Saves
+  answers to `.pulse-config` and the password to a 0600 `.pulse-secret`, so
+  re-running is a zero-prompt update; `--reconfigure` changes them.
+- `auth.py` — dashboard login, verified against DSM itself so there is no
+  second password store. `SYNO_LOGIN_GROUP` restricts to a DSM group.
+- `probe.py` / `probe2.py` — the API probers that cracked the Drive log
+  parameters. Keep them: they are how you diagnose a new Drive Server version.
 - `.github/workflows/docker-publish.yml` — CI. Push to `main` runs the tests,
   then builds and publishes `ghcr.io/<owner>/<repo>` for both architectures.
   Tags `v*` cut semver tags. Pull requests test but never publish.
@@ -69,29 +79,55 @@ Drive Server hardware** — see "Outstanding" below.
 6. Dashboard stays dependency-free static HTML. Must stay behind VPN — it
    exposes usernames and hostnames.
 
-## Outstanding — validate before trusting output
+## What the real API turned out to be
 
-The `SYNO.SynologyDrive.*` APIs are undocumented and field names vary between
-Drive Server versions. `collector.py` has candidate constants at the top:
-`CANDIDATE_CONNECTION_APIS`, `CANDIDATE_LOG_APIS`, and field-name lists
-`F_USER`, `F_TIME`, `F_PATH`, `F_ACTION`, `F_DEVICE`. These are educated
-guesses with defensive parsing, exercised only against `mock_dsm.py`.
+Recorded here because none of it is documented and all of it was surprising:
 
-Validation loop, on the first real NAS:
+- `SYNO.SynologyDrive.Log` returns error 120 unless given **`target=all` and
+  `share_type=all`**. DSM names the missing parameter in the error, which is
+  how probe2.py found them by search rather than guesswork.
+- The file path is **`s1`**; the client device is **`s2`**.
+- There is a key literally named **`target`** holding `"user"` — it is not a
+  path, and any field-name search that includes it will silently produce
+  garbage roots.
+- The action is a **numeric `type`** (13, 15, 23, 12 all carry paths on 3.1;
+  34 and 10 do not). The codes are undocumented, so the collector treats "has
+  a file path" as the evidence data moved rather than hardcoding a code table.
+- On `Connection`, **`client_name` is the USER and `client_id` is the DEVICE**.
+  `client_type` distinguishes `drive_backup` from `serversync` and `drive`.
+- Real backup paths are `/Backup/<device>/Users/<localuser>/<Root>/...`.
+- File Station **cannot list other users' homes** even as an admin (408), so
+  root inference must come from logged paths.
 
-1. Deploy the container, then
-   `docker exec backup-pulse python3 collector.py --discover` — prints every
-   `SYNO.SynologyDrive.*` API the NAS exposes plus a sample log entry.
-2. Compare the sample entry's field names to the `F_*` lists; add/reorder.
-3. If discovery is ambiguous, cross-check in browser DevTools (Network tab)
-   while clicking around Drive Admin Console > Log and > Client List.
-4. Run a real collect and sanity-check the dashboard against what Admin
-   Console shows for one known-active user.
-5. Add `--file-counts` and check runtime on a realistic dataset.
+## Validating a new site or a different Drive Server version
 
-Also unverified because no registry was reachable from the build environment:
-the image has never actually been built. `docker buildx` on a Mac is the first
-real test of the Dockerfile.
+The mappings above are confirmed on Drive Server 3.1. They are undocumented
+and can change between versions, so when a new site returns everything as
+`never`, or roots look wrong, re-run the probers rather than guessing:
+
+```
+docker exec -i backup-pulse python3 - < probe2.py
+```
+
+`probe2.py` grid-searches the Log parameters, growing the set as DSM reveals
+further requirements, and always reports what it accumulated plus every
+distinct error — including on failure. It also dumps Connection, Statistics,
+Info, and checks whether user Drive folders are listable. `probe.py` is the
+simpler adaptive version. Feed the sample item's field names into the `F_*`
+lists at the top of `collector.py`.
+
+If the API shape ever moves out of reach entirely, the fallbacks are Drive's
+PostgreSQL database on the NAS, or forwarding events via Log Center syslog.
+
+Two things still unverified:
+
+- `--file-counts` has never been run on a real dataset. It uses File Station
+  `DirSize`, and since File Station cannot list other users' homes here (408),
+  the path construction likely needs rework using `filestation_link_prefix`
+  from the log. Leave it off until then.
+- ~3,500 of 199,659 log events on the pilot had no username or timestamp and
+  were dropped. The collector now reports the count; worth confirming they are
+  team-folder or system events and not user activity being discarded.
 
 ## Prerequisites per NAS
 
@@ -108,13 +144,14 @@ real test of the Dockerfile.
 
 ## Next steps
 
-1. Push to GitHub; Actions builds and publishes the image.
-2. Make the GHCR package **public** (once) so client NASes pull without
-   credentials. Until then every site would need `docker login ghcr.io`.
-3. Deploy to one pilot NAS and run the validation loop above.
-4. Once field mappings are confirmed, roll out to remaining sites and pin each
-   to a version tag rather than `:latest`.
-5. Consider per-client SLA thresholds — currently hardcoded in `status_for()`.
+1. Confirm whether sjohn and kbonner are genuinely broken backups or just
+   people who were away — the first real judgement call the tool has produced.
+2. Roll out to remaining client sites: copy `deploy.sh`, run it, answer the
+   prompts once.
+3. Pin sites to a version tag rather than `:latest` so "which build is that
+   site on?" is answerable.
+4. Per-client SLA thresholds — still hardcoded in `status_for()`.
+5. Consider the settings UI for group selection (currently config-only).
 
 ## Backlog / not yet built
 
