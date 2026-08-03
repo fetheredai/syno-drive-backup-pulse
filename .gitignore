@@ -1,5 +1,9 @@
 .env
 config.json
+# Written by deploy.sh next to the script. .pulse-secret holds a NAS
+# administrator password — it must never reach the repository.
+.pulse-secret
+.pulse-config
 web/data.json
 web/data.json.tmp
 __pycache__/

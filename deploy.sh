@@ -187,17 +187,28 @@ if [ "$NEED_PASSWORD" = "1" ]; then
   export SYNO_PASS
 fi
 
-SECRET_ARGS=()
 if [ "$SECRET_MODE" = "file" ]; then
   if [ -n "${SYNO_PASS:-}" ]; then
     umask 077
     printf '%s' "$SYNO_PASS" > "$SECRET_FILE"
     chmod 600 "$SECRET_FILE"
   fi
-  SECRET_ARGS=(-v "$SECRET_FILE:/run/secrets/syno_pass:ro"
-               -e SYNO_PASS_FILE=/run/secrets/syno_pass)
-else
-  SECRET_ARGS=(-e SYNO_PASS="$SYNO_PASS")
+  # Docker creates a DIRECTORY at the mount point when the bind-mount source
+  # is missing. The container then cannot read a password, DSM answers "wrong
+  # account or password", and the real cause is invisible. Refuse to start.
+  if [ ! -f "$SECRET_FILE" ]; then
+    echo "Secret file $SECRET_FILE is missing or is not a regular file." >&2
+    echo "Re-run: sudo ./deploy.sh --reconfigure" >&2
+    exit 1
+  fi
+  if [ ! -s "$SECRET_FILE" ]; then
+    echo "Secret file $SECRET_FILE is empty." >&2
+    echo "Re-run: sudo ./deploy.sh --reconfigure" >&2
+    exit 1
+  fi
+elif [ -z "${SYNO_PASS:-}" ]; then
+  echo "SECRET_MODE=env but no password was supplied." >&2
+  exit 1
 fi
 
 # --- remember the non-secret answers ---------------------------------------
@@ -226,6 +237,34 @@ fi
 # --- deploy ----------------------------------------------------------------
 echo "==> pulling $PULSE_IMAGE"
 $DOCKER pull "$PULSE_IMAGE"
+
+# --- hand the secret to the container's user -------------------------------
+# The image deliberately runs as a non-root user, so a root-owned 0600 file is
+# unreadable inside the container: the collector aborts and DSM reports the
+# empty password as "wrong account or password". Ask the image which UID it
+# runs as rather than hardcoding one that could drift, and give it the file.
+SECRET_ARGS=()
+if [ "$SECRET_MODE" = "file" ]; then
+  # `|| true` matters: with `set -o pipefail`, a failing probe makes this
+  # assignment non-zero and `set -e` kills the script before the fallback
+  # below can run.
+  PULSE_UID="$($DOCKER run --rm --entrypoint id "$PULSE_IMAGE" -u 2>/dev/null \
+               | tr -dc '0-9' || true)"
+  if [ -n "$PULSE_UID" ] && chown "$PULSE_UID" "$SECRET_FILE" 2>/dev/null; then
+    chmod 600 "$SECRET_FILE"
+    echo "==> secret readable by container uid $PULSE_UID (0600)"
+    SECRET_ARGS=(-v "$SECRET_FILE:/run/secrets/syno_pass:ro"
+                 -e SYNO_PASS_FILE=/run/secrets/syno_pass)
+  else
+    # Rather than ship a container that cannot read its own password, fall
+    # back to the environment. Less private, but working.
+    echo "  ! Could not give $SECRET_FILE to the container's user;" >&2
+    echo "    passing the password as an environment variable instead." >&2
+    SECRET_ARGS=(-e SYNO_PASS="$(cat "$SECRET_FILE")")
+  fi
+else
+  SECRET_ARGS=(-e SYNO_PASS="$SYNO_PASS")
+fi
 
 if $DOCKER ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
   echo "==> removing the existing $NAME container"

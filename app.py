@@ -220,10 +220,39 @@ def shutdown(signum, _frame):
     sys.exit(0)
 
 
+def preflight():
+    """Check at startup what would otherwise only fail on someone's first
+    login attempt, hours later, with a misleading message."""
+    if not AUTH_ON:
+        log("login is DISABLED (SYNO_AUTH=false) — anyone who can reach the "
+            "port can read the dashboard")
+        return
+    try:
+        auth.service_password()
+    except Exception as e:
+        log(f"CONFIG PROBLEM: {e}")
+        log("  Sign-in will fail until this is fixed: verifying group "
+            "membership needs the service account.")
+        return
+    if auth.LOGIN_GROUP:
+        try:
+            members = auth.group_members(auth.LOGIN_GROUP)
+            log(f"sign-in restricted to '{auth.LOGIN_GROUP}' "
+                f"({len(members)} members)")
+        except Exception as e:
+            log(f"CONFIG PROBLEM: cannot read group "
+                f"'{auth.LOGIN_GROUP}': {e}")
+            log("  Sign-in will be refused for everyone until this is fixed, "
+                "because membership cannot be confirmed.")
+    else:
+        log("sign-in open to any DSM account (SYNO_LOGIN_GROUP unset)")
+
+
 def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
+    preflight()
     threading.Thread(target=collect_loop, daemon=True).start()
 
     handler = partial(Handler, directory=WEB_DIR)

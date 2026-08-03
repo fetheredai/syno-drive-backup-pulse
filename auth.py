@@ -47,15 +47,40 @@ def _session_kwargs():
     )
 
 
-def _service_password():
+def service_password():
+    """The service account's password, or raise saying exactly what is wrong.
+
+    This used to swallow every error and return "", which DSM answered with
+    'wrong account or password' — sending you to check credentials that were
+    fine. The common cause is Docker's bind-mount behaviour: if the source
+    file does not exist when the container starts, Docker creates a DIRECTORY
+    at the mount point, and reading it fails.
+    """
     pw = os.environ.get("SYNO_PASS", "")
-    if not pw and os.environ.get("SYNO_PASS_FILE"):
-        try:
-            with open(os.environ["SYNO_PASS_FILE"]) as f:
-                pw = f.read().strip()
-        except OSError:
-            pw = ""
+    if pw:
+        return pw
+    path = os.environ.get("SYNO_PASS_FILE")
+    if not path:
+        raise RuntimeError(
+            "Neither SYNO_PASS nor SYNO_PASS_FILE is set, so the service "
+            "account has no password to log in with.")
+    if os.path.isdir(path):
+        raise RuntimeError(
+            f"{path} is a directory, not a file. Docker creates one when the "
+            f"bind-mount source is missing. Re-run deploy.sh so the secret "
+            f"file exists before the container starts.")
+    try:
+        with open(path) as f:
+            pw = f.read().strip()
+    except OSError as e:
+        raise RuntimeError(f"Cannot read {path}: {e}") from e
+    if not pw:
+        raise RuntimeError(f"{path} is empty, so there is no password to use.")
     return pw
+
+
+# Kept for callers that predate the rename.
+_service_password = service_password
 
 
 def group_members(group):
@@ -67,7 +92,7 @@ def group_members(group):
             return hit[0]
     ses = collector.SynoSession(
         "auth", username=os.environ.get("SYNO_USER"),
-        password=_service_password(), **_session_kwargs())
+        password=service_password(), **_session_kwargs())
     ses.connect()
     try:
         members = ses.group_members(group)

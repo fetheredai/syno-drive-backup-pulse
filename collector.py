@@ -203,17 +203,37 @@ class SynoSession:
         return users
 
     def group_members(self, group, page_size=500, max_pages=20):
-        """Usernames in a DSM group. Raises if the group cannot be read."""
-        members, offset = set(), 0
+        """Usernames in a DSM group. Raises if the group cannot be read.
+
+        The plain call — no offset/limit — is the form verified working on
+        Drive Server 3.1 / DSM 7.0. Sending paging parameters made this fail
+        outright on real hardware, which took the administrators lookup and
+        the group filter down with it. So: ask plainly first, and only page
+        when the reply says there is more to fetch.
+        """
+        def names(payload):
+            return {u.get("name") for u in payload.get("users", []) if u.get("name")}
+
+        data = self.call("SYNO.Core.Group.Member", "list", group=group)
+        members = names(data)
+        total = data.get("total")
+        if total is None or len(members) >= total:
+            return members
+
+        offset = len(members)
         for _ in range(max_pages):
-            data = self.call("SYNO.Core.Group.Member", "list", group=group,
-                             offset=offset, limit=page_size)
-            page = data.get("users", [])
-            members |= {u.get("name") for u in page if u.get("name")}
-            total = data.get("total")
-            offset += len(page)
-            if not page or (total is not None and offset >= total) \
-                    or len(page) < page_size:
+            try:
+                page_data = self.call("SYNO.Core.Group.Member", "list",
+                                      group=group, offset=offset, limit=page_size)
+            except Exception as e:
+                print(f"  ! Group '{group}' paging stopped at {offset}: {e}")
+                break
+            page = names(page_data)
+            before = len(members)
+            members |= page
+            got = len(page_data.get("users", []))
+            offset += got
+            if not got or len(members) == before or offset >= total:
                 break
         return members
 
@@ -647,9 +667,19 @@ def _env_bool(name, default=False):
 def _env_password():
     path = os.environ.get("SYNO_PASS_FILE")
     if path:
+        if os.path.isdir(path):
+            sys.exit(f"SYNO_PASS_FILE={path} is a directory. Docker creates "
+                     f"one when the bind-mount source is missing — re-run "
+                     f"deploy.sh so the file exists before the container starts.")
         try:
             with open(path) as f:
                 return f.read().strip()
+        except PermissionError:
+            sys.exit(
+                f"SYNO_PASS_FILE={path} is not readable by this container. "
+                f"The image runs as uid {os.getuid()}, but the file belongs to "
+                f"someone else — chown it to that uid on the host, or re-run "
+                f"deploy.sh, which does that for you.")
         except OSError as e:
             sys.exit(f"SYNO_PASS_FILE set but unreadable: {e}")
     return os.environ.get("SYNO_PASS", "")
