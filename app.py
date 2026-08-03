@@ -48,12 +48,51 @@ _state = {
     "last_error": None,
     "next_run": None,
     "runs": 0,
+    "running": False,
 }
 _stop = threading.Event()
+# One collection at a time. A manual rescan and the scheduled run would
+# otherwise write data.json concurrently.
+_collect_lock = threading.Lock()
 
 
 def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+def collect_once(cfg_path=None):
+    """Run one collection. Returns False if one was already in progress."""
+    cfg_path = cfg_path or os.environ.get("SYNO_CONFIG", "/app/config.json")
+    if not _collect_lock.acquire(blocking=False):
+        log("collection already in progress; ignoring this request")
+        return False
+    try:
+        _state["running"] = True
+        cfg = collector.load_config(cfg_path)
+        days = cfg.get("days", 90)
+        output = cfg.get("output") or os.path.join(WEB_DIR, "data.json")
+        counts = cfg.get("file_counts", False)
+        log(f"collection starting (window {days}d, file_counts={counts})")
+        ok = collector.run_once(cfg, days, output, counts)
+        _state["last_ok"] = ok
+        _state["last_error"] = None if ok else "one or more NASes failed"
+        log("collection finished" + ("" if ok else " WITH ERRORS"))
+    except SystemExit as e:
+        # collector.load_config calls sys.exit on missing credentials —
+        # surface it instead of silently killing the thread.
+        _state["last_ok"] = False
+        _state["last_error"] = str(e)
+        log(f"collection aborted: {e}")
+    except Exception as e:
+        _state["last_ok"] = False
+        _state["last_error"] = repr(e)
+        log(f"collection failed: {e!r}")
+    finally:
+        _state["last_run"] = int(time.time())
+        _state["runs"] += 1
+        _state["running"] = False
+        _collect_lock.release()
+    return True
 
 
 def collect_loop():
@@ -64,28 +103,7 @@ def collect_loop():
         if _stop.wait(INTERVAL_H * 3600):
             return
     while not _stop.is_set():
-        try:
-            cfg = collector.load_config(cfg_path)
-            days = cfg.get("days", 90)
-            output = cfg.get("output") or os.path.join(WEB_DIR, "data.json")
-            counts = cfg.get("file_counts", False)
-            log(f"collection starting (window {days}d, file_counts={counts})")
-            ok = collector.run_once(cfg, days, output, counts)
-            _state["last_ok"] = ok
-            _state["last_error"] = None if ok else "one or more NASes failed"
-            log("collection finished" + ("" if ok else " WITH ERRORS"))
-        except SystemExit as e:
-            # collector.load_config calls sys.exit on missing credentials —
-            # surface it instead of silently killing the thread.
-            _state["last_ok"] = False
-            _state["last_error"] = str(e)
-            log(f"collection aborted: {e}")
-        except Exception as e:
-            _state["last_ok"] = False
-            _state["last_error"] = repr(e)
-            log(f"collection failed: {e!r}")
-        _state["last_run"] = int(time.time())
-        _state["runs"] += 1
+        collect_once(cfg_path)
         _state["next_run"] = int(time.time() + INTERVAL_H * 3600)
         if _stop.wait(INTERVAL_H * 3600):
             return
@@ -166,7 +184,23 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
-        if self.path.split("?")[0] != "/login" or not AUTH_ON:
+        path = self.path.split("?")[0]
+
+        if path == "/rescan":
+            if AUTH_ON and not self._current_user():
+                return self._send_bytes(b'{"error":"auth required"}',
+                                        "application/json", 401)
+            if _state["running"]:
+                return self._send_bytes(b'{"started":false,"running":true}',
+                                        "application/json", 202)
+            # Run off-thread: a full collection takes a minute or more on a
+            # busy server, far longer than a request should be held open.
+            threading.Thread(target=collect_once, daemon=True).start()
+            log(f"manual rescan requested by "
+                f"{self._current_user() or 'anonymous'}")
+            return self._send_bytes(b'{"started":true}', "application/json", 202)
+
+        if path != "/login" or not AUTH_ON:
             return self._send_bytes(b"Not found", "text/plain", 404)
         try:
             length = int(self.headers.get("Content-Length") or 0)

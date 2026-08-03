@@ -52,8 +52,12 @@ registry UI entirely and works.
 
 **4. Open the dashboard** at `http://<nas-ip>:8477/`.
 
-The container collects immediately on start, then every 4 hours. To force a
-collection without waiting:
+The container collects immediately on start, then every 4 hours. The
+dashboard's **Rescan** button re-reads the Drive log on demand — it starts the
+collection, then polls until it finishes and reloads, so the numbers on screen
+are never stale-but-looking-fresh. A rescan cannot overlap the scheduled run.
+
+From a shell:
 
 ```
 docker exec backup-pulse python3 collector.py
@@ -165,6 +169,13 @@ than silently presenting an empty dashboard — an empty dashboard reads as
 
 `SYNO_EXCLUDE_USERS=GuestAccount,kiosk` drops specific accounts by name.
 
+Group membership marks users rather than removing them, so the dashboard has
+an **Active / All users** toggle: Active (the default) shows the configured
+group, All shows everyone collected. The toggle hides itself when no group is
+configured, since it would do nothing. Set `SYNO_STRICT_GROUPS=true` if you
+would rather non-members were never collected at all — the toggle then has
+nothing extra to show.
+
 Users are also classified: an account with no Drive client at all is `unused`
 rather than `never`, and the dashboard hides those behind a chip. `never` is
 reserved for someone who has a client but has never actually backed anything
@@ -194,7 +205,8 @@ optional `.env`:
 | `SYNO_AUTH` | `true` | Require sign-in to view the dashboard |
 | `SYNO_LOGIN_GROUP` | — | Only this DSM group may sign in |
 | `SYNO_SESSION_HOURS` | `12` | How long a session lasts |
-| `SYNO_INCLUDE_GROUPS` | — | Only show members of these DSM groups |
+| `SYNO_INCLUDE_GROUPS` | — | Members of these DSM groups are "active" |
+| `SYNO_STRICT_GROUPS` | `false` | Drop non-members entirely instead of marking them |
 | `SYNO_EXCLUDE_USERS` | — | Hide these accounts by name |
 | `SYNO_MAX_LOG_PAGES` | `500` | Log paging cap; raise for very busy servers |
 

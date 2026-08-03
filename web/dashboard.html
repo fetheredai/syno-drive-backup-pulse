@@ -32,6 +32,15 @@
   select,input[type=search]{font-family:var(--mono);font-size:12px;padding:7px 9px;border:1px solid var(--line);
     border-radius:4px;background:var(--panel);color:var(--ink)}
   input[type=search]{width:190px}
+  .seg{display:flex;border:1px solid var(--line);border-radius:4px;overflow:hidden}
+  .seg button{border:0;background:var(--panel);color:var(--muted);cursor:pointer;
+    font-family:var(--mono);font-size:12px;padding:7px 11px}
+  .seg button+button{border-left:1px solid var(--line)}
+  .seg button[data-on="1"]{background:var(--ink);color:#fff}
+  .btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:4px;
+    padding:7px 12px;font-family:var(--mono);font-size:12px;cursor:pointer}
+  .btn:hover:not(:disabled){border-color:var(--ink)}
+  .btn:disabled{opacity:.6;cursor:default}
 
   main{max-width:1180px;margin:0 auto;padding:20px 24px 60px}
   .meta{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;
@@ -117,8 +126,12 @@
     <div class="sub" id="genat">—</div>
   </div>
   <div class="counts" id="counts"></div>
+  <div class="seg" id="scope" role="group" aria-label="Which users to show">
+    <button data-v="active" data-on="1">Active</button><button data-v="all">All users</button>
+  </div>
   <select id="nassel" aria-label="Filter by NAS"><option value="">All NASes</option></select>
   <input type="search" id="q" placeholder="find user…" aria-label="Search users">
+  <button id="rescan" class="btn" title="Re-read the Drive log now">Rescan</button>
 </header>
 
 <main>
@@ -176,7 +189,7 @@ let DATA = null;
 /* 'unused' — accounts with no Drive client at all — is off by default. On a
    typical NAS they are the overwhelming majority, and showing them buries the
    handful of users whose backups actually stopped. Click the chip to see them. */
-let filt = { statuses:new Set(['ok','stale','failing','never']), nas:'', q:'' };
+let filt = { statuses:new Set(['ok','stale','failing','never']), nas:'', q:'', scope:'active' };
 
 const rel = ts => {
   if (!ts) return 'no backups seen';
@@ -186,6 +199,12 @@ const rel = ts => {
   return Math.floor(s/86400) + ' d ago';
 };
 const fmtN = n => n==null ? '' : n.toLocaleString();
+
+/* A user is "active" when they belong to the configured DSM group. Data from
+   before this existed has no in_group field, so treat missing as active. */
+const inScope = u => filt.scope === 'all' || u.in_group !== false;
+const activeGroups = () =>
+  (DATA && DATA.nases || []).flatMap(n => n.active_groups || []);
 
 /* ---------- render ------------------------------------------------------- */
 function render(){
@@ -197,7 +216,7 @@ function render(){
   document.getElementById('windowlab').textContent = 'last ' + days + ' days · one column = one day · today at right';
 
   // status counts across everything
-  const all = DATA.nases.flatMap(n=>n.users.map(u=>({...u,_nas:n.name})));
+  const all = DATA.nases.flatMap(n=>n.users.map(u=>({...u,_nas:n.name}))).filter(inScope);
   const counts = Object.fromEntries(STATUSES.map(s=>[s, all.filter(u=>u.status===s).length]));
   const cWrap = document.getElementById('counts'); cWrap.innerHTML='';
   STATUSES.forEach(s=>{
@@ -214,6 +233,16 @@ function render(){
   // One container per NAS is the normal deployment, so the picker is only
   // meaningful when a central collector has pulled from several.
   sel.style.display = (DATA.nases.length > 1) ? '' : 'none';
+
+  // Without a configured group every user is "active", so the toggle would
+  // be a control that does nothing.
+  const groups = activeGroups();
+  const seg = document.getElementById('scope');
+  seg.style.display = groups.length ? '' : 'none';
+  seg.querySelector('[data-v=active]').title =
+    groups.length ? 'Members of ' + groups.join(', ') : '';
+  seg.querySelectorAll('button').forEach(b=>
+    b.dataset.on = (b.dataset.v === filt.scope) ? '1' : '0');
 
   // A stopped collector is itself a failure mode: without this the dashboard
   // would keep showing weeks-old data as though it were current.
@@ -242,6 +271,7 @@ function render(){
   DATA.nases.forEach(nas=>{
     if (filt.nas && nas.name !== filt.nas) return;
     const users = (nas.users||[])
+      .filter(u=>inScope(u))
       .filter(u=>filt.statuses.has(u.status))
       .filter(u=>!filt.q || (u.username+' '+(u.display_name||'')).toLowerCase().includes(filt.q))
       .sort((a,b)=> order[a.status]-order[b.status] || a.username.localeCompare(b.username));
@@ -307,6 +337,56 @@ document.addEventListener('mousemove', e=>{
 });
 
 document.getElementById('nassel').addEventListener('change', e=>{ filt.nas=e.target.value; render(); });
+
+document.getElementById('scope').addEventListener('click', e=>{
+  const b = e.target.closest('button[data-v]');
+  if (!b || b.dataset.v === filt.scope) return;
+  filt.scope = b.dataset.v;
+  render();
+});
+
+/* ---------- rescan ------------------------------------------------------- */
+/* A collection takes a minute or more on a busy server, so the request only
+   starts it; we then poll /healthz until last_run moves, and reload the data.
+   Without the polling the button would look instantaneous and show stale
+   numbers, which is worse than no button. */
+const rescanBtn = document.getElementById('rescan');
+async function jsonOrLogin(res){
+  if (res.status === 401){ location.href = '/login'; throw new Error('auth'); }
+  return res.json();
+}
+async function reloadData(){
+  const r = await fetch('data.json', {cache:'no-store'});
+  if (r.ok){ DATA = await r.json(); render(); }
+}
+rescanBtn.addEventListener('click', async ()=>{
+  const started = Date.now();
+  rescanBtn.disabled = true;
+  const tick = setInterval(()=>{
+    rescanBtn.textContent = 'Scanning ' + Math.round((Date.now()-started)/1000) + 's';
+  }, 1000);
+  rescanBtn.textContent = 'Scanning…';
+  try {
+    const before = (await jsonOrLogin(await fetch('/healthz', {cache:'no-store'}))).last_run;
+    await jsonOrLogin(await fetch('/rescan', {method:'POST'}));
+    while (Date.now() - started < 20*60*1000){
+      await new Promise(r=>setTimeout(r, 2500));
+      const h = await jsonOrLogin(await fetch('/healthz', {cache:'no-store'}));
+      if (!h.running && h.last_run && h.last_run !== before){
+        if (h.last_ok === false && h.last_error)
+          alert('The scan finished with an error:\n\n' + h.last_error);
+        break;
+      }
+    }
+    await reloadData();
+  } catch (err) {
+    if (err && err.message !== 'auth') alert('Rescan failed: ' + err);
+  } finally {
+    clearInterval(tick);
+    rescanBtn.disabled = false;
+    rescanBtn.textContent = 'Rescan';
+  }
+});
 document.getElementById('q').addEventListener('input', e=>{ filt.q=e.target.value.trim().toLowerCase(); render(); });
 
 /* ---------- shared horizontal scrolling ---------------------------------- */

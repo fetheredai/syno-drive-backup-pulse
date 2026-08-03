@@ -470,8 +470,14 @@ def collect_nas(cfg, days, want_counts):
         include_groups = [g.strip() for g in
                           os.environ.get("SYNO_INCLUDE_GROUPS", "").split(",")
                           if g.strip()]
+        # Group membership marks who is "active" rather than removing anyone,
+        # so the dashboard can toggle between the group and everybody without
+        # a re-collection. SYNO_STRICT_GROUPS=true restores hard filtering for
+        # sites that would rather not publish the other usernames at all.
+        strict = _env_bool("SYNO_STRICT_GROUPS", False)
+        allowed, group_filter_active = set(), False
         if include_groups:
-            allowed, resolved = set(), 0
+            resolved = 0
             for g in include_groups:
                 try:
                     members = ses.group_members(g)
@@ -481,22 +487,25 @@ def collect_nas(cfg, days, want_counts):
                 except Exception as e:
                     print(f"  ! Could not read group '{g}': {e}")
             if resolved:
-                before = len(users)
-                users = [u for u in users if u.get("name") in allowed]
-                print(f"  restricted to {include_groups}: "
-                      f"{len(users)} of {before} users")
-                if not users:
-                    # An empty dashboard reads as "nothing wrong", which is the
-                    # most dangerous thing this tool could imply.
-                    print("  ! The group filter matched NO users. The "
-                          "dashboard will be empty — check the group name and "
-                          "that it has members.")
+                group_filter_active = True
+                in_group = [u for u in users if u.get("name") in allowed]
+                print(f"  {len(in_group)} of {len(users)} users are in "
+                      f"{include_groups}")
+                if not in_group:
+                    # An empty default view reads as "nothing wrong", which is
+                    # the most dangerous thing this tool could imply.
+                    print("  ! No users matched those groups. The dashboard's "
+                          "default view will be empty — check the group name "
+                          "and that it has members.")
+                if strict:
+                    users = in_group
+                    print("  SYNO_STRICT_GROUPS is set: other users dropped "
+                          "entirely.")
             else:
-                # Every group lookup failed — a typo'd name would otherwise
-                # empty the dashboard and look like "all backups are fine".
-                print("  ! No configured group could be read; showing ALL "
-                      "users rather than an empty dashboard. Check "
-                      "SYNO_INCLUDE_GROUPS.")
+                # Every lookup failed — a typo'd name must not silently empty
+                # the dashboard and look like "all backups are fine".
+                print("  ! No configured group could be read; treating ALL "
+                      "users as active. Check SYNO_INCLUDE_GROUPS.")
         print(f"  {len(users)} non-admin users, admins excluded: {sorted(admins)}")
 
         conns = ses.drive_connections()
@@ -608,6 +617,9 @@ def collect_nas(cfg, days, want_counts):
             out_users.append({
                 "username": uname,
                 "display_name": u.get("description") or uname,
+                # False only when a group filter resolved and excluded them.
+                # Absent/true means "show by default".
+                "in_group": (not group_filter_active) or uname in allowed,
                 "devices": devices_by_user.get(uname, []),
                 # Which kinds of Drive client this user actually runs, taken
                 # from the log rather than the connection list: "drive_backup"
@@ -619,6 +631,7 @@ def collect_nas(cfg, days, want_counts):
                 "status": status_for(ls, now, has_footprint),
             })
         return {"name": cfg["name"], "host": cfg.get("host") or cfg.get("base_url", ""),
+                "active_groups": include_groups if group_filter_active else [],
                 "users": out_users}
     finally:
         ses.logout()

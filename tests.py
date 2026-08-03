@@ -218,6 +218,63 @@ class UnitBits(unittest.TestCase):
             srv.shutdown()
 
 
+class GroupScope(unittest.TestCase):
+    """Group membership marks who is 'active' rather than removing anyone, so
+    the dashboard can toggle between the group and everybody without needing a
+    fresh collection."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = _free_port()
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", cls.port), mock_dsm.Handler)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.cfg = {"name": "T", "host": "127.0.0.1", "port": cls.port,
+                   "https": False, "verify_ssl": False,
+                   "username": "svc-drivemonitor", "password": "s3cret"}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def tearDown(self):
+        os.environ.pop("SYNO_INCLUDE_GROUPS", None)
+        os.environ.pop("SYNO_STRICT_GROUPS", None)
+
+    def collect(self):
+        return collector.collect_nas(self.cfg, 90, False)
+
+    def test_everyone_is_active_when_no_group_configured(self):
+        r = self.collect()
+        self.assertEqual(r["active_groups"], [])
+        self.assertTrue(all(u["in_group"] for u in r["users"]))
+
+    def test_group_marks_membership_without_dropping_anyone(self):
+        os.environ["SYNO_INCLUDE_GROUPS"] = mock_dsm.VIEWER_GROUP
+        r = self.collect()
+        self.assertEqual(r["active_groups"], [mock_dsm.VIEWER_GROUP])
+        names = {u["username"] for u in r["users"]}
+        # everybody still collected...
+        self.assertGreater(len(names), len(mock_dsm.VIEWER_MEMBERS))
+        # ...but only members are flagged active
+        active = {u["username"] for u in r["users"] if u["in_group"]}
+        self.assertEqual(active, mock_dsm.VIEWER_MEMBERS)
+
+    def test_strict_mode_drops_non_members(self):
+        os.environ["SYNO_INCLUDE_GROUPS"] = mock_dsm.VIEWER_GROUP
+        os.environ["SYNO_STRICT_GROUPS"] = "true"
+        r = self.collect()
+        self.assertEqual({u["username"] for u in r["users"]},
+                         mock_dsm.VIEWER_MEMBERS)
+
+    def test_unreadable_group_treats_everyone_as_active(self):
+        """A typo'd group name must not empty the default view, which would
+        read as 'all backups are fine'."""
+        os.environ["SYNO_INCLUDE_GROUPS"] = "NoSuchGroup"
+        r = self.collect()
+        self.assertEqual(r["active_groups"], [])
+        self.assertTrue(all(u["in_group"] for u in r["users"]))
+
+
 class DashboardLogin(unittest.TestCase):
     """Login is verified against DSM itself, so there is no second password
     store. These cover the cases that decide who gets in."""
@@ -306,3 +363,37 @@ class DashboardLogin(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class RescanEndpoint(unittest.TestCase):
+    """The dashboard's Rescan button. The collection is long, so the endpoint
+    starts one and returns immediately; the page polls /healthz."""
+
+    def setUp(self):
+        import app
+        self.app = app
+        app._state.update({"running": False, "last_run": None, "runs": 0,
+                           "last_ok": None, "last_error": None})
+
+    def test_collect_once_refuses_to_overlap(self):
+        """A manual rescan landing on top of the scheduled run would have two
+        collections writing data.json at once."""
+        acquired = self.app._collect_lock.acquire(blocking=False)
+        self.assertTrue(acquired)
+        try:
+            self.assertFalse(self.app.collect_once("/nonexistent"),
+                             "second collection should be refused")
+        finally:
+            self.app._collect_lock.release()
+
+    def test_collect_once_runs_and_reports_when_lock_is_free(self):
+        # No config and no credentials, so it aborts — but it must record the
+        # attempt and release the lock rather than hanging or dying silently.
+        for k in ("SYNO_USER", "SYNO_PASS", "SYNO_PASS_FILE"):
+            os.environ.pop(k, None)
+        self.assertTrue(self.app.collect_once("/nonexistent"))
+        self.assertFalse(self.app._state["running"])
+        self.assertFalse(self.app._state["last_ok"])
+        self.assertTrue(self.app._state["last_error"])
+        self.assertTrue(self.app._collect_lock.acquire(blocking=False))
+        self.app._collect_lock.release()
