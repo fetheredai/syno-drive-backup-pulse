@@ -24,6 +24,14 @@
 
 set -euo pipefail
 
+# Print something immediately. If this banner does not appear, the script did
+# not run at all — an empty or truncated copy exits 0 silently, which is
+# indistinguishable from "nothing happened".
+echo "Backup Pulse deploy — $(date '+%Y-%m-%d %H:%M:%S')"
+
+# DEBUG=1 ./deploy.sh  traces every command.
+[ "${DEBUG:-0}" = "1" ] && set -x
+
 cd "$(dirname "$0")"
 
 NAME="${CONTAINER_NAME:-backup-pulse}"
@@ -58,18 +66,34 @@ load_env() {
 [ -f "$ENV_FILE" ] && load_env "$ENV_FILE"
 
 # --- docker ---------------------------------------------------------------
-DOCKER="docker"
-if ! docker info >/dev/null 2>&1; then
-  if command -v sudo >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1; then
-    DOCKER="sudo docker"
-  elif command -v sudo >/dev/null 2>&1; then
-    echo "Docker needs elevated rights on DSM. Re-run as: sudo ./deploy.sh" >&2
-    exit 1
-  else
-    echo "Cannot talk to the Docker daemon. Is the Docker package running?" >&2
-    exit 1
+# DSM puts the docker binary in /usr/local/bin, which sudo's secure_path does
+# not always include, so a bare `docker` can be "not found" under sudo even
+# though the package is running. Probe the known locations.
+DOCKER=""
+for cand in docker /usr/local/bin/docker /usr/bin/docker \
+            /volume1/@appstore/Docker/usr/bin/docker \
+            /volume1/@appstore/ContainerManager/usr/bin/docker; do
+  if command -v "$cand" >/dev/null 2>&1 || [ -x "$cand" ]; then
+    if "$cand" info >/dev/null 2>&1; then DOCKER="$cand"; break; fi
+    if command -v sudo >/dev/null 2>&1 && sudo -n "$cand" info >/dev/null 2>&1; then
+      DOCKER="sudo $cand"; break
+    fi
+    DOCKER_SEEN="$cand"
   fi
+done
+
+if [ -z "$DOCKER" ]; then
+  if [ -n "${DOCKER_SEEN:-}" ]; then
+    echo "Found the docker binary at $DOCKER_SEEN but could not talk to the" >&2
+    echo "daemon. Re-run with sudo, and check the Docker package is started" >&2
+    echo "in Package Center." >&2
+  else
+    echo "No docker binary found. Is the Docker (or Container Manager)" >&2
+    echo "package installed and started in Package Center?" >&2
+  fi
+  exit 1
 fi
+echo "==> using: $DOCKER"
 
 WEB_PORT="${SYNO_WEB_PORT:-8477}"
 
