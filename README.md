@@ -68,26 +68,60 @@ same reason it fails in Container Manager. On those versions, deploy over SSH
 with `deploy.sh`, which uses plain `docker` and needs no compose at all:
 
 1. Enable SSH: Control Panel > Terminal & SNMP > Enable SSH service.
-2. Create a folder on the NAS, e.g. `/volume1/docker/backup-pulse/`, and put
-   `deploy.sh` and your filled-in `.env` in it.
-3. SSH in and run:
+2. Copy `deploy.sh` to the NAS, e.g. `/volume1/docker/backup-pulse/`.
+3. SSH in and run it:
 
 ```
 cd /volume1/docker/backup-pulse
 sudo ./deploy.sh
 ```
 
-It pulls the image, removes any previous container, starts the new one with
-host networking and a restart policy, and prints the dashboard URL. Re-run the
-same command to update that site later — `.env` is the only state.
+It asks for the client name, the service account and its password, pulls the
+image, replaces any previous container, starts the new one with host
+networking and a restart policy, then waits for the first collection and tells
+you whether it actually succeeded. Re-run the same command to update the site
+later.
+
+No `.env` is required. If one is present it is used for any value you have not
+already set in the environment, which is handy for unattended re-deploys, but
+it is entirely optional.
 
 Upgrading DSM to 7.2+ gets you Container Manager and the compose workflow
 above, which is nicer to operate. `deploy.sh` keeps working either way, so
 that upgrade can happen on the client's schedule rather than yours.
 
+## Where the credentials live
+
+DSM has no API-token or app-password concept for these Web API endpoints, so a
+username and password is the only way in. Collection has to keep running
+unattended across reboots, so something has to hold that credential. There are
+three options, in increasing order of paranoia:
+
+**Prompted, passed as an environment variable (the `deploy.sh` default).**
+Nothing is written to disk. The value ends up in Docker's own container config
+and is visible to root via `docker inspect` — which is exactly where every
+other Synology container keeps its passwords, so this matches normal practice
+on the platform.
+
+**Prompted, stored in a root-only file and mounted read-only.** Run
+`sudo SECRET_MODE=file ./deploy.sh`. The password goes to a `0600` file that is
+bind-mounted into the container, and `SYNO_PASS_FILE` points at it, so
+`docker inspect` shows only a path. Better if several people have shell access
+to the NAS.
+
+**A `.env` file.** Convenient for unattended re-deploys across many sites, at
+the cost of a plaintext credential on disk that you manage. If you use one,
+`chmod 600` it and keep it off cloud-synced storage — a client's NAS admin
+password should not be syncing to Dropbox.
+
+Whichever you choose, limit the blast radius at the DSM end: the service
+account needs the administrators group, but you can still restrict it by
+source IP under Control Panel > Security > Firewall.
+
 ## Configuration
 
-Everything is environment variables, set in `.env`:
+Everything is environment variables. `deploy.sh` prompts for the essential
+ones; the rest have defaults. They can also be set in an optional `.env`:
 
 | Variable | Default | Meaning |
 |---|---|---|
