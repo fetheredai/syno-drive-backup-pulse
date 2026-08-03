@@ -119,13 +119,37 @@ class CollectorE2E(unittest.TestCase):
         self.assertEqual({r["name"] for r in self.users["alice"]["roots"]},
                          set(mock_dsm.ROOTS))
 
-    def test_roots_fall_back_to_filestation_when_log_is_empty(self):
-        # Erin has no file events, so roots come from listing /homes/erin/Drive
-        self.assertEqual({r["name"] for r in self.users["erin"]["roots"]},
-                         set(mock_dsm.ROOTS))
+    def test_no_roots_when_user_has_no_file_events(self):
+        """On real hardware File Station cannot list other users' homes (408),
+        so the fallback yields nothing and roots come only from logged paths.
+        A user who never synced therefore has no roots — not a bug."""
+        self.assertEqual(self.users["erin"]["roots"], [])
+
+    def test_path_comes_from_s1_not_the_target_key(self):
+        """Regression: the log item has a key called 'target' holding "user".
+        With it in F_PATH, every root became "user" and the real path in s1
+        was ignored."""
+        names = {r["name"] for r in self.users["alice"]["roots"]}
+        self.assertNotIn("user", names)
+        self.assertEqual(names, set(mock_dsm.ROOTS))
+
+    def test_numeric_action_codes_count_as_file_events(self):
+        """Regression: Drive Server reports action as numeric type 13, which
+        never matched the verb keyword list, so every event was discarded and
+        all users read as 'never'."""
+        self.assertTrue(self.users["alice"]["daily"])
+        self.assertEqual(self.users["alice"]["status"], "ok")
 
     def test_devices_attached(self):
-        self.assertEqual(self.users["alice"]["devices"][0]["name"], "ALICE-PC")
+        dev = self.users["alice"]["devices"][0]
+        # client_id is the DEVICE and client_name is the USER — the opposite
+        # way round from what the names suggest.
+        self.assertEqual(dev["name"], "BNO-Alice-451-L379LTDXR2.local")
+        self.assertTrue(dev["online"])          # from client_status == on_line
+        self.assertTrue(dev["last_seen"])       # from last_auth_time
+
+    def test_client_type_recorded(self):
+        self.assertEqual(self.users["alice"]["client_types"], ["drive_backup"])
 
     def test_atomic_write_leaves_no_temp_file(self):
         self.assertFalse(os.path.exists(self.out + ".tmp"))

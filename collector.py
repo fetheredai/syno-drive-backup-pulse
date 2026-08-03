@@ -82,12 +82,24 @@ CANDIDATE_CONNECTION_APIS = [
 CANDIDATE_LOG_APIS = [
     "SYNO.SynologyDrive.Log",          # Drive Admin Console > Log
 ]
-# Log item fields we look for (first match wins):
-F_USER = ["username", "user", "owner", "opuser", "user_name"]
+
+# SYNO.SynologyDrive.Log refuses to return anything without these. It names
+# the missing one in error 120, which is how they were found (see probe2.py).
+# "all"/"all" is the widest scope; narrow it only if you want a subset.
+LOG_PARAMS = {"target": "all", "share_type": "all"}
+
+# Log item fields we look for (first match wins). Verified against Drive
+# Server 3.1 on real hardware.
+#   - the file path is s1, NOT "path"
+#   - the client device is s2
+#   - "target" is present but holds "user", not a path. It must never appear
+#     in F_PATH or every event's root becomes "user".
+#   - on Connection, client_name is the USER and client_id is the DEVICE
+F_USER = ["username", "client_name", "user", "owner", "opuser", "user_name"]
 F_TIME = ["time", "timestamp", "utime", "mtime", "log_time"]
-F_PATH = ["path", "file_path", "target", "filename", "display_path", "name"]
+F_PATH = ["s1", "path", "file_path", "display_path", "filename"]
 F_ACTION = ["action", "category", "type", "event", "method"]
-F_DEVICE = ["device_name", "device", "computer_name", "client", "hostname"]
+F_DEVICE = ["s2", "client_id", "device_name", "device", "computer_name", "hostname"]
 
 # Log actions that count as "data moved" (a backup actually did something).
 SYNC_ACTIONS = {"upload", "edit", "create", "add", "modify", "sync",
@@ -218,16 +230,20 @@ class SynoSession:
         return []
 
     # -- drive: log ---------------------------------------------------------
-    def drive_log(self, since_epoch, page_size=1000, max_pages=200):
+    def drive_log(self, since_epoch, page_size=1000, max_pages=None):
         """Page through the Drive Server log, newest first, until since_epoch."""
+        if max_pages is None:
+            max_pages = int(os.environ.get("SYNO_MAX_LOG_PAGES", "500"))
         api = next((a for a in CANDIDATE_LOG_APIS if a in self.apis), None)
         if not api:
             print("  ! No SYNO.SynologyDrive.Log API found. Run --discover.")
             return []
         items, offset = [], 0
+        reached_window = False
         for _ in range(max_pages):
             try:
-                data = self.call(api, "list", offset=offset, limit=page_size)
+                data = self.call(api, "list", offset=offset, limit=page_size,
+                                 **LOG_PARAMS)
             except Exception as e:
                 print(f"  ! Drive log page failed at offset {offset}: {e}")
                 break
@@ -244,9 +260,20 @@ class SynoSession:
             stamps = [t for t in (pick_int(i, F_TIME) for i in page) if t]
             offset += len(page)
             if stamps and min(stamps) < since_epoch:
+                reached_window = True
                 break
             if len(page) < page_size:
+                reached_window = True
                 break
+        if not reached_window:
+            # We stopped on the page cap rather than on reaching the start of
+            # the window. Everything older than this point is missing, so a
+            # user whose only activity predates it would wrongly read "never".
+            # Say so loudly rather than publish a quietly-truncated calendar.
+            print(f"  ! Stopped after {max_pages} pages ({len(items)} events) "
+                  f"without reaching the start of the window. History is "
+                  f"TRUNCATED and statuses may be wrong. Raise "
+                  f"SYNO_MAX_LOG_PAGES or lower SYNO_DAYS.")
         return [i for i in items if (pick_int(i, F_TIME) or 0) >= since_epoch]
 
     # -- file counts --------------------------------------------------------
@@ -364,34 +391,69 @@ def collect_nas(cfg, days, want_counts):
                 continue
             devices_by_user[uname].append({
                 "name": pick(c, F_DEVICE, default="unknown device"),
-                "last_seen": pick_int(c, ["last_connection_time", "last_seen",
+                "last_seen": pick_int(c, ["last_auth_time", "login_time",
+                                          "last_connection_time", "last_seen",
                                           "connection_time", "time"]),
-                "online": bool(pick(c, ["online", "is_online", "connected"], False)),
-                "type": pick(c, ["client_type", "app", "type"], ""),
+                # Real field is client_status: "on_line" / "off_line".
+                "online": (str(pick(c, ["client_status"], "")).lower() == "on_line"
+                           or bool(pick(c, ["online", "is_online", "connected"], False))),
+                # "drive_backup" = a Drive Client backup task, "serversync" =
+                # server-to-server sync. Worth surfacing: they answer
+                # different questions about a user.
+                "type": pick(c, ["client_type", "app"], ""),
             })
 
         log = ses.drive_log(since)
         print(f"  {len(log)} Drive log events in the last {days} days")
         daily = defaultdict(lambda: defaultdict(int))   # user -> date -> events
         roots = defaultdict(set)                        # user -> root folders
+        client_types = defaultdict(set)                 # user -> drive_backup/...
         last_success = {}
+        type_hist = defaultdict(int)                    # action code -> count
+        counted = skipped = 0
         for item in log:
             uname = pick(item, F_USER)
             ts = pick_int(item, F_TIME)
             if not uname or not ts:
                 continue
             action = str(pick(item, F_ACTION, "")).lower()
+            path = pick(item, F_PATH)
             if action in IGNORE_ACTIONS:
                 continue
-            counts_as_sync = (not action) or any(a in action for a in SYNC_ACTIONS)
+
+            # Drive Server reports the action as a numeric code (13 = file
+            # event on 3.1), and the codes are undocumented and version-
+            # specific. Rather than hardcode a code table that will rot, treat
+            # the presence of a file path as the evidence that data actually
+            # moved — which is the definition this tool works to anyway.
+            # Verb-style actions, if a future version emits them, still use the
+            # keyword match.
+            if action.isdigit():
+                counts_as_sync = bool(path)
+            else:
+                counts_as_sync = (not action) or any(a in action for a in SYNC_ACTIONS)
+
+            type_hist[f"{action}{'' if path else ' (no path)'}"] += 1
             if not counts_as_sync:
+                skipped += 1
                 continue
+            counted += 1
+
             day = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
             daily[uname][day] += 1
             last_success[uname] = max(last_success.get(uname, 0), ts)
-            r = infer_root(pick(item, F_PATH))
+            r = infer_root(path)
             if r:
                 roots[uname].add(r)
+            ct = pick(item, ["client_type"])
+            if ct:
+                client_types[uname].add(ct)
+
+        print(f"  {counted} file events counted, {skipped} non-file events ignored")
+        if type_hist:
+            top = sorted(type_hist.items(), key=lambda kv: -kv[1])[:8]
+            print("  action-code histogram (code -> events): "
+                  + ", ".join(f"{k}={v}" for k, v in top))
 
         out_users = []
         for u in sorted(users, key=lambda x: x.get("name", "")):
@@ -426,6 +488,10 @@ def collect_nas(cfg, days, want_counts):
                 "username": uname,
                 "display_name": u.get("description") or uname,
                 "devices": devices_by_user.get(uname, []),
+                # Which kinds of Drive client this user actually runs, taken
+                # from the log rather than the connection list: "drive_backup"
+                # is a backup task, "serversync" is server-to-server sync.
+                "client_types": sorted(client_types.get(uname, [])),
                 "roots": root_list,
                 "daily": dict(daily.get(uname, {})),
                 "last_success": ls,

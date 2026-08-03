@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-Mock DSM Web API — enough of it to exercise collector.py end to end without
-a real NAS.
+Mock DSM Web API — shaped from a real Synology Drive Server 3.1 response,
+captured from a live NAS via probe2.py.
 
-This is a test fixture, not a simulator. It answers SYNO.API.Info,
-SYNO.API.Auth, SYNO.Core.User, SYNO.Core.Group.Member,
-SYNO.SynologyDrive.Connection, SYNO.SynologyDrive.Log, SYNO.FileStation.List
-and SYNO.FileStation.DirSize with realistically shaped payloads, including
-paging, so the collector's login, log pagination, field picking, day
-bucketing, root inference and status thresholds all run against something.
+This is not a guess. The Log and Connection payloads reproduce the actual
+field names, including the awkward ones:
 
-What it does NOT prove: that a real Drive Server uses these exact field
-names. That still needs `collector.py --discover` against real hardware —
-see the field-mapping section in HANDOFF.md.
+  * the file path is in `s1`, the client device in `s2`
+  * `type` is a NUMERIC action code (13 = file event), not a verb
+  * there is a key literally called `target` whose value is "user" — which
+    will be mistaken for the file path by any naive field-name search
+  * on Connection, `client_name` is the USERNAME and `client_id` is the DEVICE
+  * SYNO.SynologyDrive.Log rejects calls without `target` and `share_type`
 
-  python3 mock_dsm.py 5000        # serve
-  python3 -m unittest tests.py    # or let the test suite drive it
+    python3 mock_dsm.py 5000
+    python3 -m unittest tests -v
 """
 
-import datetime as dt
 import json
 import random
 import sys
@@ -28,64 +26,85 @@ from urllib.parse import urlparse, parse_qs
 
 SID = "mock-sid-12345"
 
-# username -> days since last backup activity (None = never backed up)
+# username -> days since last backup activity (None = never moved a file)
 USER_PROFILE = {
     "alice":  0,     # active today            -> ok
     "brian":  1,     # yesterday               -> ok
     "carol":  5,     # 5 days ago              -> stale
     "dinesh": 21,    # 3 weeks ago             -> failing
-    "erin":   None,  # never seen in the log   -> never
+    "erin":   None,  # authenticates, never syncs -> never
 }
 ADMINS = {"admin", "awhite"}
 ROOTS = ["Desktop", "Documents", "Downloads"]
+
+TYPE_FILE = 13      # observed on real hardware for file events
+TYPE_AUTH = 1       # non-file event; carries no s1 path
 
 APIS = {
     "SYNO.API.Info":                 {"path": "query.cgi", "minVersion": 1, "maxVersion": 1},
     "SYNO.API.Auth":                 {"path": "auth.cgi",  "minVersion": 1, "maxVersion": 7},
     "SYNO.Core.User":                {"path": "entry.cgi", "minVersion": 1, "maxVersion": 1},
     "SYNO.Core.Group.Member":        {"path": "entry.cgi", "minVersion": 1, "maxVersion": 1},
-    "SYNO.SynologyDrive.Connection": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 1},
+    "SYNO.SynologyDrive.Connection": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
     "SYNO.SynologyDrive.Log":        {"path": "entry.cgi", "minVersion": 1, "maxVersion": 1},
     "SYNO.FileStation.List":         {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
     "SYNO.FileStation.DirSize":      {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
 }
 
 
+def _device(user):
+    return f"BNO-{user.capitalize()}-451-L379LTDXR2.local"
+
+
+def log_item(user, ts, root=None, seq=0):
+    """One log row in the real shape."""
+    is_file = root is not None
+    return {
+        "accessable": False,
+        "client_type": "drive_backup",
+        "filestation_link_prefix": f"/homes/{user}/Drive",
+        "ip_address": "72.76.98.186",
+        "p1": "",
+        "p2": "0",
+        # The real backup layout: /Backup/<device>/Users/<localuser>/<Root>/...
+        "s1": (f"/Backup/{_device(user)}/Users/{user}win/{root}/f{seq}.docx"
+               if is_file else ""),
+        "s2": _device(user),
+        "s3": "",
+        "share_name": user,
+        "share_type": 0,
+        # Deliberately present, deliberately not a path. Any field-name search
+        # that looks for "target" will pick this up and be wrong.
+        "target": "user",
+        "target_accessable": False,
+        "target_link_prefix": "/homes//Drive",
+        "target_share_name": "",
+        "target_share_type": 0,
+        "time": ts,
+        "type": TYPE_FILE if is_file else TYPE_AUTH,
+        "username": user,
+    }
+
+
 def build_log(now=None):
-    """Newest-first log covering ~90 days, with per-user activity gaps."""
     now = int(now or time.time())
-    rnd = random.Random(1234)          # deterministic, so tests can assert
+    rnd = random.Random(1234)
     events = []
     for user, gap in USER_PROFILE.items():
         if gap is None:
-            # Erin logs in but never syncs a file — the exact silent failure
-            # this project exists to catch. These must all be filtered out.
+            # Erin's client authenticates regularly but never moves a file.
+            # These carry no s1, and must not count as backups.
             for d in range(0, 90, 7):
-                events.append({
-                    "username": user,
-                    "time": now - d * 86400,
-                    "action": "login",
-                    "path": "",
-                    "device_name": "ERIN-LAPTOP",
-                })
+                events.append(log_item(user, now - d * 86400))
             continue
         for d in range(gap, 90):
-            if rnd.random() < 0.25:    # not every day has traffic
+            if rnd.random() < 0.25:
                 continue
-            for _ in range(rnd.randint(1, 40)):
-                root = rnd.choice(ROOTS)
-                events.append({
-                    "username": user,
-                    "time": now - d * 86400 - rnd.randint(0, 80000),
-                    "action": rnd.choice(["upload", "edit", "create_file", "rename"]),
-                    "path": f"/homes/{user}/Drive/{user.upper()}-PC/{root}/f{rnd.randint(1,999)}.dat",
-                    "device_name": f"{user.upper()}-PC",
-                })
-    # a couple of admin events that must be excluded from the dashboard
+            for i in range(rnd.randint(1, 40)):
+                events.append(log_item(user, now - d * 86400 - rnd.randint(0, 80000),
+                                       root=rnd.choice(ROOTS), seq=i))
     for d in range(0, 5):
-        events.append({"username": "admin", "time": now - d * 86400,
-                       "action": "upload", "path": "/homes/admin/Drive/x.txt",
-                       "device_name": "ADMIN-PC"})
+        events.append(log_item("admin", now - d * 86400, root="Desktop"))
     events.sort(key=lambda e: e["time"], reverse=True)
     return events
 
@@ -104,14 +123,22 @@ def connections_payload():
     now = int(time.time())
     out = []
     for user, gap in USER_PROFILE.items():
-        # Note: everyone reads as "connected", including users who have not
-        # synced in weeks. That is the Admin Console blind spot.
+        # Everyone reads as on_line, including users who have not synced in
+        # weeks. That is precisely the Admin Console blind spot.
         out.append({
-            "username": user,
-            "device_name": f"{user.upper()}-PC",
-            "last_connection_time": now - (0 if gap is None else gap) * 3600,
-            "online": True,
-            "client_type": "desktop",
+            "client_can_wipe": False,
+            "client_id": _device(user),          # DEVICE
+            "client_ip": "192.168.50.232",
+            "client_is_relay": False,
+            "client_location": "",
+            "client_name": user,                 # USERNAME
+            "client_session_id": "b80294a36fb9b6dbe942fc2e827b7105",
+            "client_status": "on_line",
+            "client_type": "drive_backup",
+            "client_version": "3.5.0-16084",
+            "device_uuid": "3a6a4c02-fc0d-43de-9374-5f9e3b5845a3",
+            "last_auth_time": now - (0 if gap is None else gap) * 3600,
+            "login_time": str(now - (0 if gap is None else gap) * 3600),
         })
     return {"items": out, "total": len(out)}
 
@@ -128,8 +155,11 @@ class Handler(BaseHTTPRequestHandler):
     def _ok(self, data):
         self._send({"success": True, "data": data})
 
-    def _err(self, code):
-        self._send({"success": False, "error": {"code": code}})
+    def _err(self, code, name=None, reason=None):
+        err = {"code": code}
+        if name:
+            err["errors"] = {"name": name, "reason": reason or "required"}
+        self._send({"success": False, "error": err})
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -146,7 +176,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._ok({"sid": SID})
             return self._ok({})
 
-        # everything past here needs a session
         if q.get("_sid") != SID:
             return self._err(119)
 
@@ -163,14 +192,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._ok(connections_payload())
 
         if api == "SYNO.SynologyDrive.Log":
+            # The real server refuses without these, naming each in turn.
+            if "target" not in q:
+                return self._err(120, "target")
+            if "share_type" not in q:
+                return self._err(120, "share_type")
             page = LOG[offset:offset + limit]
             return self._ok({"items": page, "total": len(LOG)})
 
         if api == "SYNO.FileStation.List":
-            folder = q.get("folder_path", "")
-            if folder.endswith("/Drive"):
-                return self._ok({"files": [{"name": r, "isdir": True} for r in ROOTS]})
-            return self._err(408)   # no such file or directory
+            # Real behaviour observed: other users' homes are not listable by
+            # the service account, so root inference cannot rely on this.
+            return self._err(408)
 
         if api == "SYNO.FileStation.DirSize":
             if method == "start":
