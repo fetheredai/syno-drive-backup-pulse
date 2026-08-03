@@ -39,6 +39,9 @@ Drive Server hardware** — see "Outstanding" below.
 - `Dockerfile` / `docker-compose.yml` / `.env.example` / `build.sh` — the
   container packaging. Multi-arch amd64 + arm64. The compose file takes the
   image path from `PULSE_IMAGE` in `.env` rather than hardcoding an owner.
+- `deploy.sh` — SSH deployment for DSM 7.0/7.1, which have the legacy Docker
+  package with no Project tab and therefore no GUI compose. Plain `docker run`,
+  no compose dependency. Also the update mechanism on those sites.
 - `.github/workflows/docker-publish.yml` — CI. Push to `main` runs the tests,
   then builds and publishes `ghcr.io/<owner>/<repo>` for both architectures.
   Tags `v*` cut semver tags. Pull requests test but never publish.
@@ -95,7 +98,11 @@ real test of the Dockerfile.
 - Service account (e.g. `svc-drivemonitor`) in the administrators group (Drive
   Admin Console data is admin-only), **no 2FA** (no OTP handling), ideally
   source-IP restricted via DSM firewall.
-- Container Manager installed (DSM 7).
+- DSM 7.2+ with Container Manager for the compose workflow, **or** DSM 7.0/7.1
+  with the legacy Docker package plus SSH, using `deploy.sh`. The pilot site
+  (Atom C3538 / Denverton, x86_64) is on DSM 7.0.1 and takes the `deploy.sh`
+  path. Note the legacy Docker package has no Project tab and cannot add
+  ghcr.io as a registry, so SSH is not optional there.
 - Drive Admin Console log retention ≥ the history window, or the calendar is
   truncated.
 

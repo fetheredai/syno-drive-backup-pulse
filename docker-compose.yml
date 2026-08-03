@@ -10,6 +10,11 @@
 # network_mode, uncomment the ports block, and set SYNO_HOST to the NAS's own
 # LAN IP.
 
+# Keep the version key. Modern `docker compose` calls it obsolete and warns,
+# but the docker-compose v1 bundled with older DSM releases needs it, and a
+# cosmetic warning beats a hard failure at a client site.
+version: "3.7"
+
 services:
   backup-pulse:
     # Set PULSE_IMAGE in .env to the path GitHub Actions publishes, e.g.

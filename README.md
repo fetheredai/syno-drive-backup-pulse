@@ -59,6 +59,32 @@ collection without waiting:
 docker exec backup-pulse python3 collector.py
 ```
 
+### If your DSM has "Docker" instead of "Container Manager"
+
+Container Manager arrived in DSM 7.2. On DSM 7.0 and 7.1 the package is still
+called Docker, and it has no Project tab — so there is no GUI for compose.
+Adding ghcr.io under that package's Registry tab does not work either, for the
+same reason it fails in Container Manager. On those versions, deploy over SSH
+with `deploy.sh`, which uses plain `docker` and needs no compose at all:
+
+1. Enable SSH: Control Panel > Terminal & SNMP > Enable SSH service.
+2. Create a folder on the NAS, e.g. `/volume1/docker/backup-pulse/`, and put
+   `deploy.sh` and your filled-in `.env` in it.
+3. SSH in and run:
+
+```
+cd /volume1/docker/backup-pulse
+sudo ./deploy.sh
+```
+
+It pulls the image, removes any previous container, starts the new one with
+host networking and a restart policy, and prints the dashboard URL. Re-run the
+same command to update that site later — `.env` is the only state.
+
+Upgrading DSM to 7.2+ gets you Container Manager and the compose workflow
+above, which is nicer to operate. `deploy.sh` keeps working either way, so
+that upgrade can happen on the client's schedule rather than yours.
+
 ## Configuration
 
 Everything is environment variables, set in `.env`:
