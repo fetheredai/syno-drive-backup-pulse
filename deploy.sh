@@ -220,9 +220,20 @@ else
 fi
 
 echo
-echo "  dashboard  http://<nas-ip>:${WEB_PORT}/"
-echo "  health     $DOCKER exec $NAME python3 -c \"import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:${WEB_PORT}/healthz').read().decode())\""
-echo "  logs       $DOCKER logs -f $NAME"
+# The deploy itself usually runs under sudo, so $DOCKER is a bare `docker`.
+# The operator will run these follow-ups as themselves, where the socket is
+# root-only — so the hints need sudo even though we did not.
+HINT="$DOCKER"
+if [ "$(id -u)" = "0" ] && [ "$HINT" = "${HINT#sudo }" ]; then
+  HINT="sudo $DOCKER"
+fi
+# Resolve a real address instead of printing a literal placeholder.
+NAS_IP="$(ip route get 1 2>/dev/null | awk '{print $7; exit}')"
+[ -z "$NAS_IP" ] && NAS_IP="$(hostname -i 2>/dev/null | awk '{print $1}')"
+[ -z "$NAS_IP" ] && NAS_IP="<nas-ip>"
+echo "  dashboard  http://${NAS_IP}:${WEB_PORT}/"
+echo "  health     $HINT exec $NAME python3 -c \"import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:${WEB_PORT}/healthz').read().decode())\""
+echo "  logs       $HINT logs -f $NAME"
 echo
 echo "Validate the Drive API field mappings before trusting the numbers:"
-echo "  $DOCKER exec $NAME python3 collector.py --discover"
+echo "  $HINT exec $NAME python3 collector.py --discover"
