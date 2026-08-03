@@ -9,7 +9,8 @@
 <style>
   :root{
     --bg:#F2F4F6; --panel:#FFFFFF; --ink:#16232E; --muted:#5C6B78; --line:#DDE3E8;
-    --ok:#1F9D66; --stale:#D98B1F; --failing:#C6413B; --never:#8A97A3; --accent:#22679C;
+    --ok:#1F9D66; --stale:#D98B1F; --failing:#C6413B; --never:#8A97A3;
+    --unused:#B6BFC8; --accent:#22679C;
     --cell-empty:#E7ECEF;
     --c1:#D9EDE2; --c2:#A9D8BE; --c3:#63BB90; --c4:#1F9D66;
     --sans:"IBM Plex Sans",system-ui,sans-serif; --mono:"IBM Plex Mono",ui-monospace,monospace;
@@ -68,6 +69,7 @@
     color:#fff;border-radius:3px;padding:2px 6px;flex:none}
   .pill.ok{background:var(--ok)} .pill.stale{background:var(--stale)}
   .pill.failing{background:var(--failing)} .pill.never{background:var(--never)}
+  .pill.unused{background:var(--unused)}
   .who .sub{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:3px;
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .roots{margin-top:7px;display:flex;flex-wrap:wrap;gap:5px}
@@ -164,10 +166,13 @@ function sampleData(){
 }
 
 /* ---------- state -------------------------------------------------------- */
-const STATUSES = ['ok','stale','failing','never'];
-const LABELS = {ok:'OK', stale:'Stale', failing:'Failing', never:'Never'};
+const STATUSES = ['ok','stale','failing','never','unused'];
+const LABELS = {ok:'OK', stale:'Stale', failing:'Failing', never:'Never', unused:'No client'};
 let DATA = null;
-let filt = { statuses:new Set(STATUSES), nas:'', q:'' };
+/* 'unused' — accounts with no Drive client at all — is off by default. On a
+   typical NAS they are the overwhelming majority, and showing them buries the
+   handful of users whose backups actually stopped. Click the chip to see them. */
+let filt = { statuses:new Set(['ok','stale','failing','never']), nas:'', q:'' };
 
 const rel = ts => {
   if (!ts) return 'no backups seen';
@@ -226,7 +231,7 @@ function render(){
   dayKeys.forEach((k,i)=>{ if (k.endsWith('-01') || i===0)
       monthMarks.push({i, lab: new Date(k+'T00:00').toLocaleString(undefined,{month:'short'})}); });
 
-  const order = {failing:0, never:1, stale:2, ok:3};
+  const order = {failing:0, never:1, stale:2, ok:3, unused:4};
   const content = document.getElementById('content'); content.innerHTML='';
 
   DATA.nases.forEach(nas=>{

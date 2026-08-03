@@ -73,7 +73,33 @@ class CollectorE2E(unittest.TestCase):
                              f"{name} should not appear in the dashboard")
 
     def test_all_regular_users_present(self):
-        self.assertEqual(set(self.users), set(mock_dsm.USER_PROFILE))
+        self.assertEqual(set(self.users),
+                         set(mock_dsm.USER_PROFILE) | set(mock_dsm.EXTRA_USERS))
+
+    def test_no_drive_client_reads_unused_not_never(self):
+        """frank and gina have no Drive client at all — no connection, no log
+        entries. On a real NAS these are the majority; reporting them as
+        'never' buries the users whose backups actually stopped."""
+        for name in mock_dsm.EXTRA_USERS:
+            self.assertEqual(self.users[name]["status"], "unused",
+                             f"{name} should be 'unused'")
+
+    def test_never_is_reserved_for_users_with_a_drive_footprint(self):
+        """Erin has a connected client and log entries, but has never moved a
+        file. That is a real failure and must stay 'never', distinct from
+        'unused'."""
+        self.assertEqual(self.users["erin"]["status"], "never")
+
+    def test_roots_never_contain_device_names_or_generic_segments(self):
+        """Regression: infer_root fell back to the first path segment, so a
+        path like /Backup/<device>/loose-file.txt produced roots called
+        'Backup' and 'BNO-SJohn-564-....local'."""
+        for u in self.users.values():
+            for r in u["roots"]:
+                self.assertNotEqual(r["name"].lower(), "backup")
+                self.assertNotIn(".local", r["name"])
+                for d in u["devices"]:
+                    self.assertNotEqual(r["name"], d["name"])
 
     def test_user_paging_not_truncated(self):
         # SYNO.Core.User is paged; make sure we walked past page one.

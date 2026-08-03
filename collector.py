@@ -336,27 +336,69 @@ def pick_int(d, keys):
         return None
 
 
-def infer_root(path):
-    """'/homes/jsmith/Drive/DESKTOP-J5/Documents/tax/2025.pdf' -> 'Documents'
-    Falls back to the first meaningful segment."""
+KNOWN_ROOTS = {"desktop", "documents", "downloads", "pictures", "music",
+               "videos", "favorites", "appdata", "onedrive"}
+# Structural path segments that are never a user's backup root.
+GENERIC_SEGMENTS = {"backup", "users", "user", "drive", "home", "homes",
+                    "volume1", "volume2", "mydrive", "team-folders"}
+
+
+def infer_root(path, device=None):
+    """Best-effort backup root from a logged path.
+
+    Real layouts seen on Drive Server 3.1:
+      /Backup/<device>/Users/<localuser>/Desktop/tax/2025.pdf   -> Desktop
+      /homes/jsmith/Drive/DESKTOP-J5/Documents/a.txt            -> Documents
+
+    Returns None rather than guessing when nothing looks like a real folder.
+    An earlier version fell back to the first path segment, which produced
+    roots like "Backup" and "BNO-SJohn-564-DQJ3k6h74g.local" — visibly wrong,
+    and worse than showing nothing.
+    """
     if not path:
         return None
     parts = [p for p in str(path).split("/") if p]
-    known = {"desktop", "documents", "downloads", "pictures", "music",
-             "videos", "favorites", "appdata"}
-    for i, seg in enumerate(parts):
-        if seg.lower() in known:
+    if not parts:
+        return None
+    low = [p.lower() for p in parts]
+
+    # /Backup/<device>/Users/<localuser>/<ROOT>/...
+    if low[0] == "backup" and len(parts) >= 5 and low[2] == "users":
+        return parts[4]
+
+    for seg in parts:
+        if seg.lower() in KNOWN_ROOTS:
             return seg
+
     # after .../Drive/<Computer>/<root>/...
-    for i, seg in enumerate(parts):
-        if seg.lower() == "drive" and len(parts) > i + 2:
-            return parts[i + 2]
-    return parts[0] if parts else None
+    for i, seg in enumerate(low):
+        if seg == "drive" and len(parts) > i + 2:
+            cand = parts[i + 2]
+            if cand.lower() not in GENERIC_SEGMENTS:
+                return cand
+
+    # Conservative fallback over directory segments only (drop the filename),
+    # skipping structural names and anything hostname-shaped.
+    for seg in parts[:-1]:
+        s = seg.lower()
+        if s in GENERIC_SEGMENTS:
+            continue
+        if device and seg == device:
+            continue
+        if "." in seg[1:]:            # e.g. BNO-SJohn-564-XXXX.local
+            continue
+        return seg
+    return None
 
 
-def status_for(last_success, now):
+def status_for(last_success, now, has_footprint=True):
+    """has_footprint = this user has some Drive presence (a client connection,
+    or any log entry at all). Without it they simply do not use Drive, which
+    is a different thing from a backup that stopped — and on a NAS where most
+    accounts have no Drive client, lumping them together buries the handful of
+    users who actually need attention."""
     if not last_success:
-        return "never"
+        return "never" if has_footprint else "unused"
     age_days = (now - last_success) / 86400
     if age_days <= 2:
         return "ok"
@@ -379,8 +421,15 @@ def collect_nas(cfg, days, want_counts):
     since = now - days * 86400
     try:
         admins = ses.admin_usernames()
+        # Built-in and service accounts to hide. Extend per site with
+        # SYNO_EXCLUDE_USERS="GuestAccount,kiosk" (case-insensitive).
+        excluded = {"guest"}
+        excluded |= {n.strip().lower()
+                     for n in os.environ.get("SYNO_EXCLUDE_USERS", "").split(",")
+                     if n.strip()}
         users = [u for u in ses.list_users()
-                 if u.get("name") not in admins and u.get("name") not in ("guest",)]
+                 if u.get("name") not in admins
+                 and str(u.get("name", "")).lower() not in excluded]
         print(f"  {len(users)} non-admin users, admins excluded: {sorted(admins)}")
 
         conns = ses.drive_connections()
@@ -410,12 +459,15 @@ def collect_nas(cfg, days, want_counts):
         client_types = defaultdict(set)                 # user -> drive_backup/...
         last_success = {}
         type_hist = defaultdict(int)                    # action code -> count
-        counted = skipped = 0
+        seen_in_log = set()                             # any presence at all
+        counted = skipped = orphaned = 0
         for item in log:
             uname = pick(item, F_USER)
             ts = pick_int(item, F_TIME)
             if not uname or not ts:
+                orphaned += 1
                 continue
+            seen_in_log.add(uname)
             action = str(pick(item, F_ACTION, "")).lower()
             path = pick(item, F_PATH)
             if action in IGNORE_ACTIONS:
@@ -442,14 +494,15 @@ def collect_nas(cfg, days, want_counts):
             day = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
             daily[uname][day] += 1
             last_success[uname] = max(last_success.get(uname, 0), ts)
-            r = infer_root(path)
+            r = infer_root(path, pick(item, F_DEVICE))
             if r:
                 roots[uname].add(r)
             ct = pick(item, ["client_type"])
             if ct:
                 client_types[uname].add(ct)
 
-        print(f"  {counted} file events counted, {skipped} non-file events ignored")
+        print(f"  {counted} file events counted, {skipped} non-file events ignored"
+              + (f", {orphaned} with no username/timestamp" if orphaned else ""))
         if type_hist:
             top = sorted(type_hist.items(), key=lambda kv: -kv[1])[:8]
             print("  action-code histogram (code -> events): "
@@ -484,6 +537,7 @@ def collect_nas(cfg, days, want_counts):
             # last-seen here would report it as healthy. Device last-seen is
             # still carried in "devices" for display.
             ls = last_success.get(uname)
+            has_footprint = bool(devices_by_user.get(uname)) or uname in seen_in_log
             out_users.append({
                 "username": uname,
                 "display_name": u.get("description") or uname,
@@ -495,7 +549,7 @@ def collect_nas(cfg, days, want_counts):
                 "roots": root_list,
                 "daily": dict(daily.get(uname, {})),
                 "last_success": ls,
-                "status": status_for(ls, now),
+                "status": status_for(ls, now, has_footprint),
             })
         return {"name": cfg["name"], "host": cfg.get("host") or cfg.get("base_url", ""),
                 "users": out_users}

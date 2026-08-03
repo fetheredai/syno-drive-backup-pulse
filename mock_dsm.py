@@ -35,6 +35,10 @@ USER_PROFILE = {
     "erin":   None,  # authenticates, never syncs -> never
 }
 ADMINS = {"admin", "awhite"}
+# DSM accounts with no Drive client at all — no connection, no log entries.
+# On a real NAS these are the majority, and they must be distinguishable from
+# a user whose backup stopped.
+EXTRA_USERS = ["frank", "gina"]
 ROOTS = ["Desktop", "Documents", "Downloads"]
 
 TYPE_FILE = 13      # observed on real hardware for file events
@@ -103,6 +107,13 @@ def build_log(now=None):
             for i in range(rnd.randint(1, 40)):
                 events.append(log_item(user, now - d * 86400 - rnd.randint(0, 80000),
                                        root=rnd.choice(ROOTS), seq=i))
+        if user == "carol":
+            # A path that does not follow /Backup/<dev>/Users/<u>/<Root>/.
+            # It must yield no root at all rather than "Backup" or the
+            # device hostname, which is what the old fallback produced.
+            odd = log_item(user, now - gap * 86400, root="X")
+            odd["s1"] = f"/Backup/{_device(user)}/loose-file.txt"
+            events.append(odd)
     for d in range(0, 5):
         events.append(log_item("admin", now - d * 86400, root="Desktop"))
     events.sort(key=lambda e: e["time"], reverse=True)
@@ -113,7 +124,7 @@ LOG = build_log()
 
 
 def users_payload(offset, limit):
-    names = sorted(USER_PROFILE) + sorted(ADMINS) + ["guest"]
+    names = sorted(USER_PROFILE) + EXTRA_USERS + sorted(ADMINS) + ["guest"]
     rows = [{"name": n, "description": n.title() + " User", "expired": "normal"}
             for n in names]
     return {"users": rows[offset:offset + limit], "total": len(rows), "offset": offset}
