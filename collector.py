@@ -268,6 +268,42 @@ class SynoSession:
         return []
 
     # -- drive: log ---------------------------------------------------------
+    def _log_page_raw(self, api, offset, limit):
+        data = self.call(api, "list", offset=offset, limit=limit, **LOG_PARAMS)
+        for key in ("items", "logs", "list", "data"):
+            if isinstance(data.get(key), list):
+                return data[key]
+        return []
+
+    def _log_window(self, api, offset, limit, budget):
+        """Rows for one window, working around pages the server cannot serve.
+
+        Drive Server 4.0 fails a whole page with 401 "failed to get user" when
+        any row in it references a user it cannot resolve, and the same call
+        can fail transiently. Abandoning the fetch on the first error throws
+        away the entire history — which is what made a live NAS report every
+        user as 'never'. So: retry, then halve the window to isolate the bad
+        row, then skip just that row.
+        """
+        for attempt in range(3):
+            try:
+                return self._log_page_raw(api, offset, limit)
+            except Exception as e:
+                budget["last_error"] = e
+                if attempt < 2:
+                    time.sleep(0.4 * (attempt + 1))
+
+        if limit <= 1:
+            budget["skipped"] += 1
+            return []
+        if budget["splits"] >= budget["max_splits"]:
+            # Something bigger is wrong than a few unreadable rows.
+            raise budget["last_error"]
+        budget["splits"] += 1
+        half = limit // 2
+        return (self._log_window(api, offset, half, budget)
+                + self._log_window(api, offset + half, limit - half, budget))
+
     def drive_log(self, since_epoch, page_size=1000, max_pages=None):
         """Page through the Drive Server log, newest first, until since_epoch."""
         if max_pages is None:
@@ -278,32 +314,40 @@ class SynoSession:
             return []
         items, offset, pages_ok = [], 0, 0
         reached_window = False
+        budget = {"skipped": 0, "splits": 0, "max_splits": 400,
+                  "last_error": None}
         for _ in range(max_pages):
+            skipped_before = budget["skipped"]
             try:
-                data = self.call(api, "list", offset=offset, limit=page_size,
-                                 **LOG_PARAMS)
+                page = self._log_window(api, offset, page_size, budget)
             except Exception as e:
-                print(f"  ! Drive log page failed at offset {offset}: {e}")
+                print(f"  ! Drive log unavailable at offset {offset}: {e}")
                 break
-            page = None
-            for key in ("items", "logs", "list", "data"):
-                if isinstance(data.get(key), list):
-                    page = data[key]
-                    break
-            if not page:
+            skipped_here = budget["skipped"] - skipped_before
+            covered = len(page) + skipped_here
+            if not covered:
+                reached_window = True
                 break
             pages_ok += 1
             items.extend(page)
+            # Advance by the window width, not by the rows returned: a skipped
+            # row still consumed a server-side position, and advancing by the
+            # smaller count would re-read the same window forever.
+            offset += page_size
             # Only stop early if this page actually carried usable timestamps;
             # a page of unparseable times must not look like "we reached 1970".
             stamps = [t for t in (pick_int(i, F_TIME) for i in page) if t]
-            offset += len(page)
             if stamps and min(stamps) < since_epoch:
                 reached_window = True
                 break
-            if len(page) < page_size:
+            if covered < page_size:
                 reached_window = True
                 break
+        if budget["skipped"]:
+            print(f"  ! {budget['skipped']} log row(s) could not be read and "
+                  f"were skipped (the server fails these with 'failed to get "
+                  f"user' — usually a deleted account). The rest of the "
+                  f"history was collected normally.")
         if not reached_window and pages_ok:
             # We stopped on the page cap rather than on reaching the start of
             # the window. Everything older than this point is missing, so a

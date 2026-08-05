@@ -24,7 +24,8 @@ API mappings are validated against real hardware; mock_dsm.py reproduces the
 real payloads. First live run found one failing and one stale backup among 5
 users with Drive clients, out of 80 DSM accounts.
 
-Has login (DSM-backed), DSM-group filtering, and zero-prompt redeploys.
+Has login (DSM-backed), DSM-group filtering, a manual rescan button, an
+Active/All users toggle, and zero-prompt redeploys. Collects every 4 hours.
 
 ## Files
 
@@ -35,8 +36,13 @@ Has login (DSM-backed), DSM-group filtering, and zero-prompt redeploys.
   counts via File Station DirSize. Config comes from environment variables, or
   from `config.json` if that file exists. Writes `data.json` atomically.
 - `app.py` — container entrypoint. One process: a background thread running
-  collect-then-sleep on `SYNO_INTERVAL_HOURS`, plus a threaded HTTP server for
-  `web/` with a `/healthz` endpoint and `no-store` on `data.json`.
+  collect-then-sleep on `SYNO_INTERVAL_HOURS` (4h), plus a threaded HTTP
+  server for `web/`. Routes: `/` (dashboard), `/login`, `/logout`, `/healthz`,
+  `POST /rescan`. A lock stops a manual rescan overlapping the scheduled run.
+  Everything is `no-store`; without that a logged-out browser kept serving the
+  dashboard from cache and logout did nothing. `preflight()` checks the
+  service password and login group at startup so misconfiguration appears in
+  the container log at boot, not on someone's first login attempt.
 - `web/dashboard.html` — single static file, vanilla JS, no build step. Status
   filter chips, user search, shared-axis heatmap wall, hover tooltips. Falls
   back to embedded sample data if `data.json` is missing, so it demos offline.
@@ -77,7 +83,17 @@ Has login (DSM-backed), DSM-group filtering, and zero-prompt redeploys.
    image's `dashboard.html` and keep serving the old one after an image update.
    `data.json` is rebuilt every run, so nothing needs persisting.
 6. Dashboard stays dependency-free static HTML. Must stay behind VPN — it
-   exposes usernames and hostnames.
+   exposes usernames and hostnames, and speaks plain HTTP.
+7. `SYNO_INCLUDE_GROUPS` marks users active rather than dropping them, so the
+   Active/All toggle needs no re-collection. `SYNO_STRICT_GROUPS=true` drops
+   non-members instead. A group that cannot be read marks everyone active: a
+   typo must never empty the view, because an empty dashboard reads as "all
+   backups are fine".
+8. The secret file is chowned to the image's own uid. The image runs as a
+   non-root user, so a root-owned 0600 file is unreadable inside the
+   container — that broke both collection and login, and DSM reported the
+   resulting empty password as "wrong account or password", which pointed at
+   entirely the wrong thing.
 
 ## What the real API turned out to be
 
@@ -98,6 +114,36 @@ Recorded here because none of it is documented and all of it was surprising:
 - Real backup paths are `/Backup/<device>/Users/<localuser>/<Root>/...`.
 - File Station **cannot list other users' homes** even as an admin (408), so
   root inference must come from logged paths.
+
+## Drive Server 4.0 (second site, DSM 7.3.2)
+
+Good news: **4.0 uses the same parameters and the same field names as 3.1.**
+`target=all&share_type=all`, path in `s1`, device in `s2`, numeric `type`,
+`client_type` separating `drive_backup` from `system`. No version branching is
+needed and none exists.
+
+What is different, and cost a long diagnosis:
+
+- The log can fail an entire page with `401 {"line": 377, "message": "failed
+  to get user"}` — apparently when a row references a user the server cannot
+  resolve. The same call may also fail transiently and then work moments
+  later. The original collector abandoned the whole fetch on the first page
+  error, so one bad row reported every user as `never`.
+  `_log_window()` now retries, then halves the window to isolate the row, then
+  skips just that row.
+- `total` is meaningless on 4.0: it comes back as `limit * 6 + 1`. Never page
+  on it. The collector pages on returned row counts and timestamps.
+- `share_type` must be a string (`all`); numeric values return `120:type`.
+  `target` appears to be ignored — `user`, `mydrive`, `home` and `all` all
+  return identical results.
+- The log mixes team-folder traffic (`client_type: "system"`, empty username,
+  `target: "@Creative"`) with user backups. Rows without a username are
+  correctly ignored, since backup health is per user.
+
+`probe4.py` and `probe5.py` are the tools that established this: probe4
+searches parameter encodings and API versions, probe5 sweeps page size,
+isolates unreadable rows, and reports which query returns rows with real
+usernames.
 
 ## Validating a new site or a different Drive Server version
 
@@ -144,9 +190,12 @@ Two things still unverified:
 
 ## Next steps
 
-1. Confirm whether sjohn and kbonner are genuinely broken backups or just
+1. Set `SYNO_INCLUDE_GROUPS=SynologyDriveUsers` on the pilot
+   (`sudo ./deploy.sh --reconfigure`) — the group exists but is not yet wired
+   up, so the Active/All toggle stays hidden.
+2. Confirm whether sjohn and kbonner are genuinely broken backups or just
    people who were away — the first real judgement call the tool has produced.
-2. Roll out to remaining client sites: copy `deploy.sh`, run it, answer the
+3. Roll out to remaining client sites: copy `deploy.sh`, run it, answer the
    prompts once.
 3. Pin sites to a version tag rather than `:latest` so "which build is that
    site on?" is answerable.

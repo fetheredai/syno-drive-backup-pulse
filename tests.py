@@ -434,3 +434,69 @@ class NewSiteSafety(unittest.TestCase):
             self.assertIn("probe2.py", out)
         finally:
             srv.shutdown()
+
+
+class ResilientLogPaging(unittest.TestCase):
+    """Drive Server 4.0 fails a whole page with 401 'failed to get user' when
+    one row references a user it cannot resolve, and the same call can fail
+    transiently. Either used to abandon the entire fetch, which made a live
+    NAS report every user as 'never'."""
+
+    def _run(self, handler_cls):
+        port = _free_port()
+        srv = ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                r = collector.collect_nas(
+                    {"name": "T", "host": "127.0.0.1", "port": port,
+                     "https": False, "verify_ssl": False,
+                     "username": "svc-drivemonitor", "password": "s3cret"},
+                    90, False)
+            return r, buf.getvalue()
+        finally:
+            srv.shutdown()
+
+    def test_one_unreadable_row_does_not_lose_the_history(self):
+        from urllib.parse import urlparse, parse_qs
+        POISON = 1234
+
+        class Poison(mock_dsm.Handler):
+            def do_GET(self):
+                q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+                if q.get("api") == "SYNO.SynologyDrive.Log":
+                    off, lim = int(q.get("offset", 0)), int(q.get("limit", 100))
+                    if off <= POISON < off + lim:
+                        return self._send({"success": False, "error": {
+                            "code": 401,
+                            "errors": {"line": 377,
+                                       "message": "failed to get user"}}})
+                return super().do_GET()
+
+        r, out = self._run(Poison)
+        active = [u for u in r["users"] if u["daily"]]
+        self.assertTrue(active, "history must survive one unreadable row")
+        self.assertIn("could not be read", out)
+        # The bad row is isolated, not a whole page of 1000.
+        self.assertIn("1 log row(s)", out)
+
+    def test_transient_failure_is_retried_not_fatal(self):
+        from urllib.parse import urlparse, parse_qs
+        state = {"failed": False}
+
+        class Flaky(mock_dsm.Handler):
+            def do_GET(self):
+                q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+                if q.get("api") == "SYNO.SynologyDrive.Log" and not state["failed"]:
+                    state["failed"] = True          # fail exactly once
+                    return self._send({"success": False, "error": {
+                        "code": 401,
+                        "errors": {"line": 377, "message": "failed to get user"}}})
+                return super().do_GET()
+
+        r, out = self._run(Flaky)
+        self.assertTrue([u for u in r["users"] if u["daily"]],
+                        "a single transient failure must not lose the log")
+        self.assertNotIn("could not be read", out)
