@@ -397,3 +397,40 @@ class RescanEndpoint(unittest.TestCase):
         self.assertTrue(self.app._state["last_error"])
         self.assertTrue(self.app._collect_lock.acquire(blocking=False))
         self.app._collect_lock.release()
+
+
+class NewSiteSafety(unittest.TestCase):
+    """A different Drive Server version can return a log this parser turns
+    into nothing. The run still succeeds, so it must say so loudly rather than
+    present a fleet that looks entirely un-backed-up."""
+
+    def test_warns_when_clients_exist_but_nothing_parsed(self):
+        import io, contextlib
+        from urllib.parse import urlparse, parse_qs
+
+        class Alien(mock_dsm.Handler):
+            """Log rows in a shape we do not understand."""
+            def do_GET(self):
+                q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+                if q.get("api") == "SYNO.SynologyDrive.Log":
+                    return self._ok({"items": [
+                        {"who": "alice", "when": 123, "file": "/x"}], "total": 1})
+                return super().do_GET()
+
+        port = _free_port()
+        srv = ThreadingHTTPServer(("127.0.0.1", port), Alien)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                r = collector.collect_nas(
+                    {"name": "T", "host": "127.0.0.1", "port": port,
+                     "https": False, "verify_ssl": False,
+                     "username": "svc-drivemonitor", "password": "s3cret"},
+                    90, False)
+            out = buf.getvalue()
+            self.assertTrue(all(not u["daily"] for u in r["users"]))
+            self.assertIn("WARNING", out)
+            self.assertIn("probe2.py", out)
+        finally:
+            srv.shutdown()

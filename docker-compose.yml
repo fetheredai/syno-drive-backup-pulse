@@ -43,10 +43,26 @@ services:
       SYNO_USER: "${SYNO_USER:?set SYNO_USER in .env}"
       SYNO_PASS: "${SYNO_PASS:?set SYNO_PASS in .env}"
 
+      # --- who may view the dashboard ------------------------------------
+      # Staff sign in with their own DSM account. Set SYNO_LOGIN_GROUP to
+      # limit that to one DSM group. SYNO_AUTH=false disables login entirely.
+      SYNO_AUTH: "${SYNO_AUTH:-true}"
+      SYNO_LOGIN_GROUP: "${SYNO_LOGIN_GROUP:-}"
+      SYNO_SESSION_HOURS: "${SYNO_SESSION_HOURS:-12}"
+
+      # --- which users appear --------------------------------------------
+      # Members of these DSM groups are "active" and shown by default; the
+      # dashboard's Active/All toggle reveals the rest. SYNO_STRICT_GROUPS
+      # drops non-members from collection entirely instead.
+      SYNO_INCLUDE_GROUPS: "${SYNO_INCLUDE_GROUPS:-}"
+      SYNO_STRICT_GROUPS: "${SYNO_STRICT_GROUPS:-false}"
+      SYNO_EXCLUDE_USERS: "${SYNO_EXCLUDE_USERS:-}"
+
       # --- behaviour ----------------------------------------------------
       SYNO_DAYS: "${SYNO_DAYS:-90}"              # history window
       SYNO_INTERVAL_HOURS: "${SYNO_INTERVAL_HOURS:-4}"
       SYNO_FILE_COUNTS: "${SYNO_FILE_COUNTS:-false}"  # slow; opt in
+      SYNO_MAX_LOG_PAGES: "${SYNO_MAX_LOG_PAGES:-500}"
       SYNO_WEB_PORT: "${SYNO_WEB_PORT:-8477}"
 
 # Deliberately no volume on /app/web: data.json is rebuilt from the NAS log on

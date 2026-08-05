@@ -141,7 +141,11 @@ class SynoSession:
         if not data.get("success"):
             err = data.get("error") or {}
             code = err.get("code")
-            hint = AUTH_ERRORS.get(code, "")
+            # These hints are specific to SYNO.API.Auth. The same numbers mean
+            # different things elsewhere — the Drive log returns 401 for
+            # "failed to get user", which is not a disabled account.
+            hint = (AUTH_ERRORS.get(code, "")
+                    if params.get("api") == "SYNO.API.Auth" else "")
             raise RuntimeError(f"[{self.name}] API error on {params.get('api')}: "
                                f"{json.dumps(err)}{hint}")
         return data.get("data", {})
@@ -272,7 +276,7 @@ class SynoSession:
         if not api:
             print("  ! No SYNO.SynologyDrive.Log API found. Run --discover.")
             return []
-        items, offset = [], 0
+        items, offset, pages_ok = [], 0, 0
         reached_window = False
         for _ in range(max_pages):
             try:
@@ -288,6 +292,7 @@ class SynoSession:
                     break
             if not page:
                 break
+            pages_ok += 1
             items.extend(page)
             # Only stop early if this page actually carried usable timestamps;
             # a page of unparseable times must not look like "we reached 1970".
@@ -299,7 +304,7 @@ class SynoSession:
             if len(page) < page_size:
                 reached_window = True
                 break
-        if not reached_window:
+        if not reached_window and pages_ok:
             # We stopped on the page cap rather than on reaching the start of
             # the window. Everything older than this point is missing, so a
             # user whose only activity predates it would wrongly read "never".
@@ -630,6 +635,20 @@ def collect_nas(cfg, days, want_counts):
                 "last_success": ls,
                 "status": status_for(ls, now, has_footprint),
             })
+        # A new site on a different Drive Server version can return a log we
+        # parse into nothing, and the run still "succeeds" — every user simply
+        # reads never/unused. That looks like a fleet with no backups rather
+        # than a broken parser, so say it out loud.
+        with_activity = sum(1 for u in out_users if u["daily"])
+        if not with_activity and (conns or log):
+            print("  ! WARNING: no user shows any file activity, yet this NAS "
+                  f"reports {len(conns)} Drive client(s) and {len(log)} log "
+                  "entries.")
+            print("    That usually means this Drive Server version uses "
+                  "different log fields or parameters, not that nobody is "
+                  "backing up. Verify with:")
+            print("      docker exec -i backup-pulse python3 - < probe2.py")
+
         return {"name": cfg["name"], "host": cfg.get("host") or cfg.get("base_url", ""),
                 "active_groups": include_groups if group_filter_active else [],
                 "users": out_users}
